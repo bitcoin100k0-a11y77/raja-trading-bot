@@ -180,6 +180,9 @@ class TradingBot:
         except OSError as e:
             logger.warning("Could not start health server: %s", e)
 
+        # === PRELOAD 400 M15 BARS FOR S/R ZONES ===
+        self._preload_market_data()
+
         # Startup notification
         learning = self.db.get_learning_summary()
         self.telegram.notify_startup({
@@ -207,6 +210,88 @@ class TradingBot:
 
         logger.info("Bot stopped.")
 
+    def _preload_market_data(self):
+        """
+        Preload 400 M15 bars on startup so the bot can immediately
+        detect S/R zones, trend structure, and be ready for trades.
+        """
+        logger.info("=" * 50)
+        logger.info("PRELOADING MARKET DATA (400 M15 bars)...")
+        logger.info("=" * 50)
+
+        # Fetch 400+ M15 bars
+        df = self.data.preload_bars(min_bars=400)
+        if df.empty:
+            logger.error("PRELOAD FAILED - no historical data available!")
+            self.telegram.notify_error(
+                "Startup preload failed: no historical data. "
+                "Bot will try to build zones on next tick."
+            )
+            return
+
+        price = float(df["Close"].iloc[-1])
+
+        # Fetch HTF (1H) data for zone stacking
+        htf_df = self.data.fetch_htf_bars(timeframe="1h", lookback_days=30)
+
+        # Run full market analysis on preloaded data
+        market = self.analyzer.analyze(df, htf_df, price)
+
+        # Store last bar time so _tick knows where we left off
+        self._last_bar_time = df.index[-1]
+
+        # Log the preloaded market state
+        logger.info("=" * 50)
+        logger.info("PRELOAD COMPLETE")
+        logger.info("Bars loaded: %d | Price: $%.2f", len(df), price)
+        logger.info("Trend: %s | Session: %s | Volume: %s",
+                     market.trend.value, market.session.value,
+                     market.current_volume_level.value)
+        logger.info("Support zones: %d | Resistance zones: %d",
+                     len(market.support_levels), len(market.resistance_levels))
+
+        for i, s in enumerate(market.support_levels):
+            logger.info("  SUP %d: $%.2f (touches=%d, htf=%s, str=%.1f)",
+                         i + 1, s.price, s.touches, s.htf_aligned, s.strength)
+        for i, r in enumerate(market.resistance_levels):
+            logger.info("  RES %d: $%.2f (touches=%d, htf=%s, str=%.1f)",
+                         i + 1, r.price, r.touches, r.htf_aligned, r.strength)
+
+        logger.info("Swing highs: %s", [f"${h:.2f}" for h in market.swing_highs])
+        logger.info("Swing lows: %s", [f"${l:.2f}" for l in market.swing_lows])
+        logger.info("Volatility: %.1f pips | Avg body: $%.2f",
+                     market.volatility_pips, market.avg_body_size)
+        logger.info("=" * 50)
+
+        # Send Telegram notification with preloaded zones
+        sup_text = "\n".join(
+            f"  ${s.price:.2f} ({s.touches}t"
+            f"{' HTF' if s.htf_aligned else ''}"
+            f" str={s.strength:.1f})"
+            for s in market.support_levels
+        ) or "  None found"
+
+        res_text = "\n".join(
+            f"  ${r.price:.2f} ({r.touches}t"
+            f"{' HTF' if r.htf_aligned else ''}"
+            f" str={r.strength:.1f})"
+            for r in market.resistance_levels
+        ) or "  None found"
+
+        self.telegram.notify_status({
+            "preload": True,
+            "bars_loaded": len(df),
+            "price": price,
+            "trend": market.trend.value,
+            "session": market.session.value,
+            "volume": market.current_volume_level.value,
+            "support_count": len(market.support_levels),
+            "resistance_count": len(market.resistance_levels),
+            "support_text": sup_text,
+            "resistance_text": res_text,
+            "volatility_pips": market.volatility_pips,
+        })
+
     def _tick(self):
         """Single iteration of the main loop."""
 
@@ -215,8 +300,8 @@ class TradingBot:
             self._check_daily_summary()
             return
 
-        # 1. Fetch data
-        df = self.data.fetch_bars(lookback_days=7)
+        # 1. Fetch data (10 days to maintain 400+ bars for S/R)
+        df = self.data.fetch_bars(lookback_days=10)
         if df.empty:
             logger.warning("No data available, skipping tick")
             return

@@ -34,6 +34,7 @@ class DataConnector:
         self._consecutive_failures = 0
 
     def fetch_bars(self, lookback_days: int = 7,
+                   min_bars: int = 0,
                    use_cache: bool = True) -> pd.DataFrame:
         """Fetch M15 bars with retry logic."""
         # Check cache
@@ -189,6 +190,35 @@ class DataConnector:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
         return pd.DataFrame()
+
+    def preload_bars(self, min_bars: int = 400) -> pd.DataFrame:
+        """
+        Preload enough historical M15 data to guarantee at least `min_bars` bars.
+        Gold trades ~22h/day, 5 days/week = ~440 M15 bars per week.
+        We fetch progressively more days until we have enough bars.
+        """
+        # Start with 8 days (~400-440 bars), escalate if needed
+        days_attempts = [8, 14, 21, 30, 45, 59]
+
+        for days in days_attempts:
+            logger.info("Preloading historical data: trying %d days for %d+ bars...",
+                        days, min_bars)
+            df = self.fetch_bars(lookback_days=days, use_cache=False)
+            if not df.empty and len(df) >= min_bars:
+                logger.info("Preloaded %d bars (%d days) — ready for analysis",
+                            len(df), days)
+                return df
+            elif not df.empty:
+                logger.info("Got %d bars from %d days, need %d — trying more...",
+                            len(df), days, min_bars)
+
+        # Return whatever we got
+        if not df.empty:
+            logger.warning("Could only preload %d bars (target: %d) — "
+                           "proceeding with available data", len(df), min_bars)
+        else:
+            logger.error("Failed to preload any historical data!")
+        return df
 
     @property
     def is_healthy(self) -> bool:

@@ -178,7 +178,31 @@ class TelegramNotifier:
         self.send_sync(text)
 
     def notify_status(self, status: Dict):
-        """Periodic status update."""
+        """Periodic status update or preload market snapshot."""
+
+        # Preload market data notification
+        if status.get("preload"):
+            text = (
+                "📊 <b>MARKET DATA PRELOADED</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Bars: {status.get('bars_loaded', 0)} x M15\n"
+                f"Price: ${status.get('price', 0):,.2f}\n"
+                f"Trend: {status.get('trend', '?')}\n"
+                f"Session: {status.get('session', '?')}\n"
+                f"Volume: {status.get('volume', '?')}\n"
+                f"Volatility: {status.get('volatility_pips', 0):.1f} pips\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"<b>Support Zones ({status.get('support_count', 0)}):</b>\n"
+                f"{status.get('support_text', 'None')}\n\n"
+                f"<b>Resistance Zones ({status.get('resistance_count', 0)}):</b>\n"
+                f"{status.get('resistance_text', 'None')}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "✅ Ready for trades"
+            )
+            self.send_sync(text)
+            return
+
+        # Normal periodic status
         risk = status.get("risk_status", {})
         text = (
             "📈 <b>STATUS UPDATE</b>\n"

@@ -32,7 +32,7 @@ class StrategyConfig:
     pip_value_per_lot: float = 10.0
 
     # === S/R DETECTION PIPELINE ===
-    sr_scan_range: int = 300
+    sr_scan_range: int = 400
     swing_lookback: int = 5
     sr_zone_tolerance: float = 4.0
     min_touches: int = 3
