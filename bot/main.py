@@ -206,6 +206,12 @@ class TradingBot:
                 logger.error("Error in main loop: %s", e, exc_info=True)
                 self.telegram.notify_error(str(e))
 
+            # Periodic hourly status — runs regardless of market state or new bar
+            try:
+                self._check_periodic_status()
+            except Exception as e:
+                logger.error("Error in periodic status: %s", e)
+
             time.sleep(self.cfg.update_interval_seconds)
 
         logger.info("Bot stopped.")
@@ -420,22 +426,60 @@ class TradingBot:
                         if trade:
                             self.learner.on_trade_closed(trade)
 
-        # Periodic status update
-        now = time.time()
-        if now - self._last_status_time >= self._status_interval:
-            status = self.paper.get_status()
-            self.telegram.notify_status(status)
-            self._last_status_time = now
-
-            # Learning report
-            report = self.learner.get_learning_report()
-            if report["trades_analyzed"] > 0:
-                self.telegram.notify_learning_report(report)
-
-            self._log_status(status)
-
         # Daily summary check
         self._check_daily_summary()
+
+    def _check_periodic_status(self):
+        """
+        Send hourly Telegram status update — runs every tick regardless
+        of market state or whether a new bar has arrived.
+        """
+        now = time.time()
+        if now - self._last_status_time < self._status_interval:
+            return
+
+        self._last_status_time = now
+
+        # Get bot performance status
+        status = self.paper.get_status()
+
+        # Try to add live market context
+        try:
+            price = self.data.get_current_price()
+            if price:
+                status["current_price"] = price
+
+            # Quick market analysis for the status message
+            df = self.data.fetch_bars(lookback_days=10)
+            if not df.empty and len(df) >= 20:
+                htf_df = self.data.fetch_htf_bars(timeframe="1h", lookback_days=30)
+                current_price = float(df["Close"].iloc[-1])
+                market = self.analyzer.analyze(df, htf_df, current_price)
+                status["current_price"] = current_price
+                status["trend"] = market.trend.value
+                status["session"] = market.session.value
+                status["volume"] = market.current_volume_level.value
+                status["support_count"] = len(market.support_levels)
+                status["resistance_count"] = len(market.resistance_levels)
+                status["nearest_support"] = (
+                    market.support_levels[0].price
+                    if market.support_levels else None
+                )
+                status["nearest_resistance"] = (
+                    market.resistance_levels[0].price
+                    if market.resistance_levels else None
+                )
+        except Exception as e:
+            logger.warning("Could not fetch market context for status: %s", e)
+
+        # Send via Telegram
+        self.telegram.notify_status(status)
+        self._log_status(status)
+
+        # Learning report if we have data
+        report = self.learner.get_learning_report()
+        if report["trades_analyzed"] > 0:
+            self.telegram.notify_learning_report(report)
 
     def _manage_active_trades(self, price: float) -> list:
         """Update all active trades with current price."""

@@ -202,19 +202,52 @@ class TelegramNotifier:
             self.send_sync(text)
             return
 
-        # Normal periodic status
+        # Normal periodic status (hourly)
+        now = datetime.now(timezone.utc)
         risk = status.get("risk_status", {})
+
         text = (
-            "📈 <b>STATUS UPDATE</b>\n"
+            "📈 <b>HOURLY STATUS UPDATE</b>\n"
+            f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"Balance: ${status.get('balance', 0):,.2f}\n"
-            f"PnL: ${status.get('total_pnl', 0):+,.2f} "
+        )
+
+        # Market context if available
+        price = status.get("current_price")
+        if price:
+            text += f"💰 Price: ${price:,.2f}\n"
+        trend = status.get("trend")
+        if trend:
+            text += f"📊 Trend: {trend}\n"
+        session = status.get("session")
+        if session:
+            text += f"🕐 Session: {session}\n"
+        volume = status.get("volume")
+        if volume:
+            text += f"📶 Volume: {volume}\n"
+
+        # S/R zones
+        sup = status.get("nearest_support")
+        res = status.get("nearest_resistance")
+        if sup or res:
+            text += "━━━━━━━━━━━━━━━━━\n"
+            sc = status.get("support_count", 0)
+            rc = status.get("resistance_count", 0)
+            if sup:
+                text += f"🟢 Nearest Support: ${sup:,.2f} ({sc} zones)\n"
+            if res:
+                text += f"🔴 Nearest Resistance: ${res:,.2f} ({rc} zones)\n"
+
+        text += (
+            "━━━━━━━━━━━━━━━━━\n"
+            f"💵 Balance: ${status.get('balance', 0):,.2f}\n"
+            f"📉 PnL: ${status.get('total_pnl', 0):+,.2f} "
             f"({status.get('total_pnl_pct', 0):+.1f}%)\n"
-            f"Win Rate: {status.get('win_rate', 0):.1f}%\n"
-            f"Today: {status.get('trades_today', 0)} trades "
+            f"🎯 Win Rate: {status.get('win_rate', 0):.1f}%\n"
+            f"📋 Today: {status.get('trades_today', 0)} trades "
             f"(${status.get('daily_pnl', 0):+.2f})\n"
-            f"Open: {status.get('open_trades', 0)}\n"
-            f"Risk: {risk.get('current_risk_pct', 1.0):.2f}%"
+            f"📂 Open: {status.get('open_trades', 0)}\n"
+            f"⚠️ Risk: {risk.get('current_risk_pct', 1.0):.2f}%"
         )
         self.send_sync(text)
 
