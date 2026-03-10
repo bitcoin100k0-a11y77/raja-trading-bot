@@ -1,13 +1,16 @@
 """
 Raja Banks Trading Agent - Data Connector
-Yahoo Finance (GC=F) M15 bar fetching with retry logic and caching.
+Twelve Data API (XAU/USD) M15 bar fetching with retry logic and caching.
 Production-ready for continuous 24/5 operation.
+
+Free tier: 800 API calls/day, 8 calls/minute.
 """
+import os
 import time
 import logging
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -15,23 +18,105 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
+BASE_URL = "https://api.twelvedata.com"
+
+# Twelve Data interval mapping
+INTERVAL_MAP = {
+    "15m": "15min",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1day",
+}
 
 
 class DataConnector:
     """
-    Fetches XAUUSD (GC=F) M15 bars from Yahoo Finance.
+    Fetches XAUUSD (XAU/USD) M15 bars from Twelve Data API.
     Includes retry logic for network failures and smart caching.
     """
 
     def __init__(self, symbol: str = "GC=F", timeframe: str = "15m",
                  cache_minutes: int = 1):
-        self.symbol = symbol
+        # Map Yahoo symbol to Twelve Data symbol
+        self.yahoo_symbol = symbol
+        self.symbol = "XAU/USD"  # Twelve Data uses forex pair notation
         self.timeframe = timeframe
+        self.td_interval = INTERVAL_MAP.get(timeframe, "15min")
         self.cache_minutes = cache_minutes
         self._cache: Optional[pd.DataFrame] = None
         self._cache_time: Optional[datetime] = None
-        self._ticker = yf.Ticker(symbol)
         self._consecutive_failures = 0
+
+        # API key from environment
+        self.api_key = os.getenv("TWELVEDATA_API_KEY", "")
+        if not self.api_key:
+            logger.warning("TWELVEDATA_API_KEY not set! Data fetching will fail.")
+
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "RajaTradingBot/1.0"})
+
+    def _fetch_from_api(self, interval: str, outputsize: int = 500,
+                        start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """
+        Core fetch from Twelve Data time_series endpoint.
+        Returns DataFrame with OHLCV data indexed by UTC datetime.
+        """
+        params = {
+            "symbol": self.symbol,
+            "interval": interval,
+            "apikey": self.api_key,
+            "outputsize": min(outputsize, 5000),
+            "timezone": "UTC",
+            "dp": 2,  # decimal places
+        }
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+
+        url = f"{BASE_URL}/time_series"
+        resp = self._session.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Check for API errors
+        if data.get("status") == "error":
+            raise ValueError(f"Twelve Data API error: {data.get('message', 'unknown')}")
+
+        values = data.get("values", [])
+        if not values:
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        df = pd.DataFrame(values)
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df.set_index("datetime", inplace=True)
+
+        # Convert string columns to float
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+
+        # Volume may not be present for forex pairs
+        if "volume" in df.columns:
+            df["volume"] = df["volume"].astype(float)
+        else:
+            df["volume"] = 0.0
+
+        # Rename to standard OHLCV format
+        df.rename(columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }, inplace=True)
+
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+        # Twelve Data returns newest first, reverse to chronological order
+        df.sort_index(inplace=True)
+
+        return df
 
     def fetch_bars(self, lookback_days: int = 7,
                    min_bars: int = 0,
@@ -43,22 +128,20 @@ class DataConnector:
             if age < self.cache_minutes * 60:
                 return self._cache.copy()
 
-        lookback_days = min(lookback_days, 59)
+        # Calculate how many bars we need
+        # M15: ~4 bars/hour, ~88 bars/day (22h trading)
+        bars_needed = max(min_bars, int(lookback_days * 88))
+        bars_needed = min(bars_needed, 5000)  # Twelve Data max
 
         for attempt in range(MAX_RETRIES):
             try:
-                end = datetime.now(timezone.utc)
-                start = end - timedelta(days=lookback_days)
-
-                df = self._ticker.history(
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    interval=self.timeframe,
-                    auto_adjust=True,
+                df = self._fetch_from_api(
+                    interval=self.td_interval,
+                    outputsize=bars_needed,
                 )
 
                 if df.empty:
-                    logger.warning("No data from Yahoo Finance (attempt %d/%d)",
+                    logger.warning("No data from Twelve Data (attempt %d/%d)",
                                    attempt + 1, MAX_RETRIES)
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY)
@@ -68,13 +151,6 @@ class DataConnector:
                         return self._cache.copy()
                     return pd.DataFrame()
 
-                # Ensure UTC timezone
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize("UTC")
-                else:
-                    df.index = df.index.tz_convert("UTC")
-
-                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                 df.dropna(inplace=True)
 
                 # Add helper columns
@@ -116,10 +192,24 @@ class DataConnector:
         return df.iloc[-1]
 
     def get_current_price(self) -> Optional[float]:
-        df = self.fetch_bars(lookback_days=1)
-        if df.empty:
-            return None
-        return float(df["Close"].iloc[-1])
+        """Get latest price from Twelve Data /price endpoint (lightweight)."""
+        try:
+            url = f"{BASE_URL}/price"
+            resp = self._session.get(url, params={
+                "symbol": self.symbol,
+                "apikey": self.api_key,
+            }, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if "price" in data:
+                return float(data["price"])
+        except Exception as e:
+            logger.warning("Price fetch failed: %s", e)
+
+        # Fallback to cached data
+        if self._cache is not None and not self._cache.empty:
+            return float(self._cache["Close"].iloc[-1])
+        return None
 
     def estimate_spread(self, df: Optional[pd.DataFrame] = None,
                         window: int = 20) -> float:
@@ -160,28 +250,24 @@ class DataConnector:
     def fetch_htf_bars(self, timeframe: str = "1h",
                        lookback_days: int = 30) -> pd.DataFrame:
         """Fetch higher timeframe bars for HTF zone stacking."""
+        td_interval = INTERVAL_MAP.get(timeframe, "1h")
+
+        # HTF bars needed: ~22 bars/day for 1h
+        bars_needed = min(lookback_days * 22, 5000)
+
         for attempt in range(MAX_RETRIES):
             try:
-                end = datetime.now(timezone.utc)
-                start = end - timedelta(days=min(lookback_days, 59))
-                df = self._ticker.history(
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    interval=timeframe,
-                    auto_adjust=True,
+                df = self._fetch_from_api(
+                    interval=td_interval,
+                    outputsize=bars_needed,
                 )
+
                 if df.empty:
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY)
                         continue
                     return pd.DataFrame()
 
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize("UTC")
-                else:
-                    df.index = df.index.tz_convert("UTC")
-
-                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
                 df.dropna(inplace=True)
                 return df
 
@@ -194,30 +280,41 @@ class DataConnector:
     def preload_bars(self, min_bars: int = 400) -> pd.DataFrame:
         """
         Preload enough historical M15 data to guarantee at least `min_bars` bars.
-        Gold trades ~22h/day, 5 days/week = ~440 M15 bars per week.
-        We fetch progressively more days until we have enough bars.
+        Twelve Data supports up to 5000 bars in a single request.
         """
-        # Start with 8 days (~400-440 bars), escalate if needed
-        days_attempts = [8, 14, 21, 30, 45, 59]
+        logger.info("Preloading %d+ M15 bars from Twelve Data...", min_bars)
 
-        for days in days_attempts:
-            logger.info("Preloading historical data: trying %d days for %d+ bars...",
-                        days, min_bars)
-            df = self.fetch_bars(lookback_days=days, use_cache=False)
-            if not df.empty and len(df) >= min_bars:
-                logger.info("Preloaded %d bars (%d days) — ready for analysis",
-                            len(df), days)
-                return df
-            elif not df.empty:
-                logger.info("Got %d bars from %d days, need %d — trying more...",
-                            len(df), days, min_bars)
+        # Request more than needed to ensure we have enough after cleanup
+        request_size = min(min_bars + 100, 5000)
 
-        # Return whatever we got
-        if not df.empty:
+        df = self._fetch_from_api(
+            interval=self.td_interval,
+            outputsize=request_size,
+        )
+
+        if df.empty:
+            logger.error("Failed to preload any historical data!")
+            return df
+
+        df.dropna(inplace=True)
+
+        # Add helper columns
+        df["body"] = abs(df["Close"] - df["Open"])
+        df["range"] = df["High"] - df["Low"]
+        df["body_ratio"] = df["body"] / df["range"].replace(0, np.nan)
+        df["body_ratio"] = df["body_ratio"].fillna(0)
+        df["bullish"] = df["Close"] > df["Open"]
+
+        # Cache
+        self._cache = df.copy()
+        self._cache_time = datetime.now(timezone.utc)
+        self._consecutive_failures = 0
+
+        if len(df) >= min_bars:
+            logger.info("Preloaded %d bars — ready for analysis", len(df))
+        else:
             logger.warning("Could only preload %d bars (target: %d) — "
                            "proceeding with available data", len(df), min_bars)
-        else:
-            logger.error("Failed to preload any historical data!")
         return df
 
     @property

@@ -482,8 +482,36 @@ class TradingBot:
             self.telegram.notify_learning_report(report)
 
     def _manage_active_trades(self, price: float) -> list:
-        """Update all active trades with current price."""
-        return self.trade_mgr.update_trades(price)
+        """Update all active trades with current price and send Telegram notifications."""
+        # Snapshot SL stages before update to detect changes
+        sl_before = {
+            tid: (t.sl_price, t.sl_stage.value)
+            for tid, t in self.trade_mgr.active_trades.items()
+        }
+
+        exits = self.trade_mgr.update_trades(price)
+
+        # Check for SL stage changes and notify
+        for tid, trade in self.trade_mgr.active_trades.items():
+            if tid in sl_before:
+                old_sl, old_stage = sl_before[tid]
+                if trade.sl_stage.value != old_stage:
+                    self.telegram.notify_sl_update(
+                        tid, old_sl, trade.sl_price, trade.sl_stage.value
+                    )
+
+        # Notify partial closes (TP1 hits) via Telegram
+        for event in exits:
+            if not event["full_close"]:
+                self.telegram.notify_trade_update({
+                    "trade_id": event["trade_id"],
+                    "event": event["reason"].value if hasattr(event["reason"], "value") else str(event["reason"]),
+                    "exit_price": event["exit_price"],
+                    "pnl_pips": event["pnl_pips"],
+                    "lots_closed": event["lots_closed"],
+                })
+
+        return exits
 
     def _check_daily_summary(self):
         """Send daily summary at end of trading session."""

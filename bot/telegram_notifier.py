@@ -177,6 +177,19 @@ class TelegramNotifier:
         )
         self.send_sync(text)
 
+    def notify_trade_update(self, info: Dict):
+        """Partial close or other trade update (e.g., TP1 hit)."""
+        text = (
+            f"🎯 <b>TRADE UPDATE</b>\n"
+            f"ID: <code>{info.get('trade_id', '?')}</code>\n"
+            f"Event: {info.get('event', '?')}\n"
+            f"Price: ${info.get('exit_price', 0):.2f}\n"
+            f"PnL: {info.get('pnl_pips', 0):.0f} pips\n"
+            f"Lots closed: {info.get('lots_closed', 0):.2f}\n"
+            "⏳ Remaining position running..."
+        )
+        self.send_sync(text)
+
     def notify_status(self, status: Dict):
         """Periodic status update or preload market snapshot."""
 
