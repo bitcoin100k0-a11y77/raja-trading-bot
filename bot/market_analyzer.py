@@ -87,10 +87,15 @@ class MarketAnalyzer:
         four_h = get_4h_candle_number(utc_hour)
         high_vol = is_high_volume_session(session)
 
-        # Volume analysis
-        avg_vol = float(df["Volume"].tail(20).mean()) if "Volume" in df else 0
-        current_vol = float(df["Volume"].iloc[-1]) if "Volume" in df else 0
-        vol_level = self._classify_volume(current_vol, avg_vol)
+        # Volume analysis — XAU/USD on Twelve Data often has 0 volume
+        # Default to MEDIUM when no real volume data exists
+        avg_vol = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
+        current_vol = float(df["Volume"].iloc[-1]) if "Volume" in df.columns else 0
+        if avg_vol == 0 and current_vol == 0:
+            # No real volume data (common for forex/commodities)
+            vol_level = VolumeLevel.MEDIUM
+        else:
+            vol_level = self._classify_volume(current_vol, avg_vol)
 
         # Body/volatility
         avg_body = float(df["body"].tail(20).mean()) if "body" in df else 1.0

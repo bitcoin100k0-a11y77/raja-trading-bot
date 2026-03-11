@@ -202,18 +202,11 @@ class TradeManager:
                 SLStage.STAGE_3: ExitReason.SL_STAGE3,
             }
             reason = reason_map.get(trade.sl_stage, ExitReason.SL_STAGE1)
-
-            pnl_pips = price_to_pips(price - trade.entry_price)
-            if trade.direction == TradeDirection.SELL:
-                pnl_pips = price_to_pips(trade.entry_price - price)
-            # Make it negative if actually a loss
-            if (trade.direction == TradeDirection.BUY and price < trade.entry_price) or \
-               (trade.direction == TradeDirection.SELL and price > trade.entry_price):
-                pnl_pips = -pnl_pips
+            pnl_pips = self._calc_pnl_pips(trade, trade.sl_price)
 
             logger.info("SL hit (%s): %s at %.2f, PnL %.1f pips",
                          trade.sl_stage.name, trade.trade_id,
-                         price, pnl_pips)
+                         trade.sl_price, pnl_pips)
 
             return {
                 "trade_id": trade.trade_id,
@@ -320,6 +313,30 @@ class TradeManager:
             logger.info("SL Stage 3 (BE): %s moved SL %.2f -> %.2f",
                          trade.trade_id, old_sl, trade.sl_price)
 
+        elif trade.sl_stage == SLStage.STAGE_3 and \
+             getattr(self.cfg, 'trailing_enabled', True) and \
+             favorable_pips >= getattr(self.cfg, 'trailing_activation_pips', 50.0):
+            # Trailing stop: lock in profits by trailing SL behind price
+            trail_dist = pips_to_price(getattr(self.cfg, 'trailing_distance_pips', 20.0))
+            if trade.direction == TradeDirection.BUY:
+                # For BUY: trail SL below the current high-water mark
+                new_sl = trade.entry_price + pips_to_price(favorable_pips) - trail_dist
+                if new_sl > trade.sl_price:
+                    old_sl = trade.sl_price
+                    trade.sl_price = round(new_sl, 2)
+                    logger.info("Trailing SL: %s moved SL %.2f -> %.2f (+%.1f pips locked)",
+                                trade.trade_id, old_sl, trade.sl_price,
+                                price_to_pips(trade.sl_price - trade.entry_price))
+            else:
+                # For SELL: trail SL above the current low-water mark
+                new_sl = trade.entry_price - pips_to_price(favorable_pips) + trail_dist
+                if new_sl < trade.sl_price:
+                    old_sl = trade.sl_price
+                    trade.sl_price = round(new_sl, 2)
+                    logger.info("Trailing SL: %s moved SL %.2f -> %.2f (+%.1f pips locked)",
+                                trade.trade_id, old_sl, trade.sl_price,
+                                price_to_pips(trade.entry_price - trade.sl_price))
+
     def _check_giveback(self, trade: ActiveTrade,
                         favorable_pips: float) -> Optional[Dict]:
         """
@@ -354,11 +371,16 @@ class TradeManager:
         return None
 
     def check_opposite_close(self, open_p: float, close_p: float,
-                             current_price: float) -> List[Dict]:
+                             current_price: float,
+                             body_ratio_val: float = 0.0) -> List[Dict]:
         """
-        Emergency exit: if candle closes OPPOSITE to our trade direction, exit immediately.
-        BUY trade → candle closes bearish (close < open) → emergency exit.
-        SELL trade → candle closes bullish (close > open) → emergency exit.
+        Emergency exit on strong opposite candle — only when ALL conditions met:
+        1. Trade is still in Stage 1 (hasn't moved in our favor yet)
+        2. Opposite candle has strong body (>= 0.60 body ratio)
+        3. Trade is currently in the red
+
+        This prevents exiting on normal pullback candles which are part of
+        healthy price action. The 3-stage SL handles normal adverse movement.
         """
         exits = []
         for trade_id, trade in list(self.active_trades.items()):
@@ -368,30 +390,51 @@ class TradeManager:
             elif trade.direction == TradeDirection.SELL and close_p > open_p:
                 opposite = True
 
-            if opposite:
-                if trade.direction == TradeDirection.BUY:
-                    pnl_pips = price_to_pips(current_price - trade.entry_price)
-                    if current_price < trade.entry_price:
-                        pnl_pips = -pnl_pips
-                else:
-                    pnl_pips = price_to_pips(trade.entry_price - current_price)
-                    if current_price > trade.entry_price:
-                        pnl_pips = -pnl_pips
+            if not opposite:
+                continue
 
-                logger.warning("Opposite close exit: %s at %.2f (candle closed against direction)",
-                                trade_id, current_price)
+            # Only emergency exit in Stage 1 — once SL has been tightened,
+            # let the SL system do its job
+            if trade.sl_stage != SLStage.STAGE_1:
+                continue
 
-                exits.append({
-                    "trade_id": trade_id,
-                    "reason": ExitReason.EMERGENCY_EXIT,
-                    "exit_price": current_price,
-                    "pnl_pips": pnl_pips,
-                    "lots_closed": trade.remaining_lots,
-                    "full_close": True,
-                })
-                del self.active_trades[trade_id]
+            # Only exit on STRONG opposite candles (body ratio >= 0.60)
+            if body_ratio_val < 0.60:
+                continue
+
+            # Only exit if trade is currently losing
+            pnl_pips = self._calc_pnl_pips(trade, current_price)
+            if pnl_pips >= 0:
+                continue
+
+            logger.warning("Opposite close exit: %s at %.2f (strong opposite candle, body=%.2f, pnl=%.1f pips)",
+                            trade_id, current_price, body_ratio_val, pnl_pips)
+
+            exits.append({
+                "trade_id": trade_id,
+                "reason": ExitReason.EMERGENCY_EXIT,
+                "exit_price": current_price,
+                "pnl_pips": pnl_pips,
+                "lots_closed": trade.remaining_lots,
+                "full_close": True,
+            })
+            del self.active_trades[trade_id]
 
         return exits
+
+    def _calc_pnl_pips(self, trade: ActiveTrade, price: float) -> float:
+        """
+        Calculate signed PnL in pips for a trade at a given price.
+        Positive = profitable, negative = losing.
+        """
+        if trade.direction == TradeDirection.BUY:
+            return price_to_pips(price - trade.entry_price) * (
+                1 if price >= trade.entry_price else -1
+            )
+        else:
+            return price_to_pips(trade.entry_price - price) * (
+                1 if price <= trade.entry_price else -1
+            )
 
     def emergency_exit(self, trade_id: str, current_price: float,
                        reason: str = "opposite_close") -> Optional[Dict]:
@@ -400,14 +443,7 @@ class TradeManager:
         if not trade:
             return None
 
-        if trade.direction == TradeDirection.BUY:
-            pnl_pips = price_to_pips(current_price - trade.entry_price)
-            if current_price < trade.entry_price:
-                pnl_pips = -pnl_pips
-        else:
-            pnl_pips = price_to_pips(trade.entry_price - current_price)
-            if current_price > trade.entry_price:
-                pnl_pips = -pnl_pips
+        pnl_pips = self._calc_pnl_pips(trade, current_price)
 
         logger.warning("Emergency exit: %s at %.2f (%s)",
                         trade_id, current_price, reason)
@@ -427,10 +463,7 @@ class TradeManager:
         """Close all trades at session end."""
         exits = []
         for trade_id, trade in list(self.active_trades.items()):
-            if trade.direction == TradeDirection.BUY:
-                pnl_pips = price_to_pips(current_price - trade.entry_price)
-            else:
-                pnl_pips = price_to_pips(trade.entry_price - current_price)
+            pnl_pips = self._calc_pnl_pips(trade, current_price)
 
             exits.append({
                 "trade_id": trade_id,
@@ -445,6 +478,45 @@ class TradeManager:
         if exits:
             logger.info("Session end: closed %d trades", len(exits))
         return exits
+
+    def restore_trades_from_db(self, open_trades: List[Dict]):
+        """
+        Restore active trades from database rows after bot restart.
+        Each row should come from TradingDatabase.get_open_trades().
+        """
+        restored = 0
+        for row in open_trades:
+            try:
+                direction = TradeDirection(row["direction"])
+                sl_stage_val = row.get("sl_stage", 1)
+                sl_stage = SLStage(sl_stage_val) if sl_stage_val in (1, 2, 3) else SLStage.STAGE_1
+
+                trade = ActiveTrade(
+                    trade_id=row["trade_id"],
+                    direction=direction,
+                    entry_price=row["entry_price"],
+                    lot_size=row["lot_size"],
+                    sl_price=row["sl_current"],
+                    sl_stage=sl_stage,
+                    tp1_price=row.get("tp1_price") or 0.0,
+                    tp2_price=row.get("tp2_price") or 0.0,
+                    tp1_hit=bool(row.get("tp1_hit", 0)),
+                    partial_close_pct=row.get("partial_close_pct", 0.0),
+                    max_favorable_pips=0.0,  # Will be re-calculated on next tick
+                    c0_extreme=None,  # Lost on restart — conservative SL fallback used
+                )
+                self.active_trades[trade.trade_id] = trade
+                restored += 1
+                logger.info("Restored trade: %s %s at %.2f (SL %.2f, stage %s)",
+                            trade.trade_id, trade.direction.value,
+                            trade.entry_price, trade.sl_price, trade.sl_stage.name)
+            except Exception as e:
+                logger.error("Failed to restore trade %s: %s",
+                             row.get("trade_id", "?"), e)
+
+        if restored:
+            logger.info("Restored %d open trade(s) from database", restored)
+        return restored
 
     def get_active_trade_count(self) -> int:
         return len(self.active_trades)

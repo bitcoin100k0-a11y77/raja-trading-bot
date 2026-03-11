@@ -68,6 +68,11 @@ class StrategyConfig:
     sl_stage2_pips: float = 25.0
     sl_stage3_pips: float = 40.0
 
+    # === TRAILING STOP (after Stage 3 / breakeven) ===
+    trailing_enabled: bool = True
+    trailing_activation_pips: float = 50.0  # Start trailing after +50 pips
+    trailing_distance_pips: float = 20.0  # Trail 20 pips behind price
+
     # === TAKE PROFIT ===
     tp1_rr: float = 1.0
     tp1_close_pct: float = 0.50
@@ -160,6 +165,11 @@ class BotConfig:
         cfg.strategy.session_end = _env_int("SESSION_END", 21)
         cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 13)
         cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 16)
+
+        # Trailing stop
+        cfg.strategy.trailing_enabled = _env_bool("TRAILING_ENABLED", True)
+        cfg.strategy.trailing_activation_pips = _env_float("TRAILING_ACTIVATION_PIPS", 50.0)
+        cfg.strategy.trailing_distance_pips = _env_float("TRAILING_DISTANCE_PIPS", 20.0)
 
         # Risk
         cfg.risk.risk_percent = _env_float("RISK_PERCENT", 1.0)

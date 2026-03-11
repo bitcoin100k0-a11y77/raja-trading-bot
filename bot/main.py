@@ -30,7 +30,7 @@ from trade_manager import TradeManager
 from paper_trader import PaperTrader
 from learning_agent import LearningAgent
 from telegram_notifier import TelegramNotifier
-from utils import get_session, is_tradeable_session, body_ratio, utc_now
+from utils import get_session, is_tradeable_session, body_ratio, utc_now, price_to_pips
 
 
 # === LOGGING SETUP ===
@@ -48,7 +48,6 @@ def setup_logging(level: str = "INFO", data_dir: str = "data"):
                         format=log_format, handlers=handlers)
 
     # Suppress noisy libraries
-    logging.getLogger("yfinance").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("peewee").setLevel(logging.WARNING)
 
@@ -86,6 +85,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "win_rate": round(bot.db.get_win_rate() * 100, 1),
                 "open_trades": bot.trade_mgr.get_active_trade_count(),
                 "data_healthy": bot.data.is_healthy,
+                "data_source": bot.data.active_source,
+                "data_sources_available": bot.data.available_sources,
                 "last_bar": bot._last_bar_time.isoformat() if bot._last_bar_time else None,
                 "patterns_blocked": len(bot.db.get_blocked_patterns()),
             }
@@ -129,11 +130,25 @@ class TradingBot:
         os.makedirs(self.cfg.data_dir, exist_ok=True)
 
         logger.info("=" * 60)
-        logger.info("Initializing Raja Banks Trading Bot v1.0")
+        logger.info("Initializing Raja Banks Trading Bot v1.1")
         logger.info("Mode: %s", "PAPER TRADING" if self.cfg.dry_run else "LIVE")
         logger.info("Symbol: %s | Timeframe: %s",
                      self.cfg.strategy.symbol, self.cfg.strategy.timeframe)
         logger.info("=" * 60)
+
+        # === CRITICAL: Validate API key before anything else ===
+        api_key = os.getenv("TWELVEDATA_API_KEY", "")
+        if not api_key:
+            logger.critical(
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            logger.critical(
+                "TWELVEDATA_API_KEY is NOT SET! The bot CANNOT fetch data.")
+            logger.critical(
+                "Set it in Railway env vars. Get a free key at https://twelvedata.com")
+            logger.critical(
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        else:
+            logger.info("Twelve Data API key: %s...%s (set)", api_key[:4], api_key[-4:])
 
         # Initialize components
         self.db = TradingDatabase(
@@ -156,6 +171,14 @@ class TradingBot:
         self._last_status_time = 0
         self._last_daily_summary_date = None
         self._health_server = None
+
+        # Restore open trades from DB (survive restarts)
+        open_trades = self.db.get_open_trades()
+        if open_trades:
+            restored = self.trade_mgr.restore_trades_from_db(open_trades)
+            logger.info("Restored %d open trade(s) from previous session", restored)
+        else:
+            logger.info("No open trades to restore from database")
 
         logger.info("Balance: $%.2f | Risk: %.1f%%",
                      self.paper.balance, self.cfg.risk.risk_percent)
@@ -303,13 +326,14 @@ class TradingBot:
 
         # Skip if market closed
         if not self.data.is_market_open():
+            logger.debug("Market closed, skipping tick")
             self._check_daily_summary()
             return
 
         # 1. Fetch data (10 days to maintain 400+ bars for S/R)
         df = self.data.fetch_bars(lookback_days=10)
         if df.empty:
-            logger.warning("No data available, skipping tick")
+            logger.warning("NO DATA from Twelve Data — check TWELVEDATA_API_KEY is set and valid!")
             return
 
         # Check for new bar
@@ -324,10 +348,10 @@ class TradingBot:
         utc_hour = latest_time.hour if hasattr(latest_time, 'hour') else 12
         price = float(df["Close"].iloc[-1])
 
-        logger.info("--- New bar: %s | Price: $%.2f ---",
-                     latest_time.strftime("%Y-%m-%d %H:%M"), price)
+        logger.info("--- New bar: %s | Price: $%.2f | Bars: %d ---",
+                     latest_time.strftime("%Y-%m-%d %H:%M"), price, len(df))
 
-        # 2. Fetch HTF data
+        # 2. Fetch HTF data (only on new bar to save API calls)
         htf_df = self.data.fetch_htf_bars(timeframe="1h", lookback_days=30)
 
         # 3. Market analysis
@@ -338,14 +362,35 @@ class TradingBot:
                      market.current_volume_level.value,
                      len(market.support_levels), len(market.resistance_levels))
 
+        # Log nearest S/R for debugging (so we can see if zones exist)
+        if market.support_levels:
+            nearest_sup = market.support_levels[0]
+            logger.info("  Nearest SUP: $%.2f (touches=%d, dist=%.1f pips)",
+                         nearest_sup.price, nearest_sup.touches,
+                         price_to_pips(abs(price - nearest_sup.price)))
+        else:
+            logger.warning("  NO SUPPORT LEVELS detected!")
+        if market.resistance_levels:
+            nearest_res = market.resistance_levels[0]
+            logger.info("  Nearest RES: $%.2f (touches=%d, dist=%.1f pips)",
+                         nearest_res.price, nearest_res.touches,
+                         price_to_pips(abs(price - nearest_res.price)))
+        else:
+            logger.warning("  NO RESISTANCE LEVELS detected!")
+
         # 4. Manage active trades
         exit_events = self._manage_active_trades(price)
 
-        # Check opposite close emergency exit
+        # Check opposite close emergency exit (only on strong opposite candles)
         if self.trade_mgr.get_active_trade_count() > 0 and len(df) >= 1:
             bar = df.iloc[-1]
+            bar_body_ratio = body_ratio(
+                float(bar["Open"]), float(bar["Close"]),
+                float(bar["High"]), float(bar["Low"])
+            )
             opp_exits = self.trade_mgr.check_opposite_close(
-                float(bar["Open"]), float(bar["Close"]), price
+                float(bar["Open"]), float(bar["Close"]), price,
+                body_ratio_val=bar_body_ratio
             )
             if opp_exits:
                 exit_events.extend(opp_exits)
@@ -362,11 +407,18 @@ class TradingBot:
                         self.telegram.notify_trade_closed(trade)
 
         # 5. Generate new signals
-        if is_tradeable_session(utc_hour, self.cfg.strategy.session_start,
-                                self.cfg.strategy.session_end):
+        in_session = is_tradeable_session(utc_hour, self.cfg.strategy.session_start,
+                                          self.cfg.strategy.session_end)
+        if not in_session:
+            logger.info("Outside trading session (hour=%d, window=%d-%d), no new signals",
+                         utc_hour, self.cfg.strategy.session_start,
+                         self.cfg.strategy.session_end)
 
+        if in_session:
             blocked = [p["pattern_key"] for p in self.db.get_blocked_patterns()]
             signals = self.strategy.generate_signals(df, market, blocked)
+            logger.info("Signal generation: %d signals produced, %d pending C0 orders",
+                         len(signals), len(self.strategy.pending_orders))
 
             # 6. Filter through learning agent
             for sig in signals:
@@ -443,14 +495,9 @@ class TradingBot:
         # Get bot performance status
         status = self.paper.get_status()
 
-        # Try to add live market context
+        # Add live market context using CACHED data only (no extra API calls)
         try:
-            price = self.data.get_current_price()
-            if price:
-                status["current_price"] = price
-
-            # Quick market analysis for the status message
-            df = self.data.fetch_bars(lookback_days=10)
+            df = self.data.fetch_bars(lookback_days=10, use_cache=True)
             if not df.empty and len(df) >= 20:
                 htf_df = self.data.fetch_htf_bars(timeframe="1h", lookback_days=30)
                 current_price = float(df["Close"].iloc[-1])
@@ -491,7 +538,7 @@ class TradingBot:
 
         exits = self.trade_mgr.update_trades(price)
 
-        # Check for SL stage changes and notify
+        # Check for SL stage changes, notify and persist to DB
         for tid, trade in self.trade_mgr.active_trades.items():
             if tid in sl_before:
                 old_sl, old_stage = sl_before[tid]
@@ -499,6 +546,14 @@ class TradingBot:
                     self.telegram.notify_sl_update(
                         tid, old_sl, trade.sl_price, trade.sl_stage.value
                     )
+                    # Persist SL update to DB so it survives restarts
+                    try:
+                        self.db.update_trade(tid, {
+                            "sl_current": trade.sl_price,
+                            "sl_stage": trade.sl_stage.value,
+                        })
+                    except Exception as e:
+                        logger.error("Failed to persist SL update for %s: %s", tid, e)
 
         # Notify partial closes (TP1 hits) via Telegram
         for event in exits:
@@ -527,16 +582,27 @@ class TradingBot:
 
         self._last_daily_summary_date = today
 
-        # Gather daily stats
+        # Gather daily stats from DB
         trades_today = self.db.get_trades_today()
         daily_pnl = self.db.get_daily_pnl()
+
+        # Query actual wins/losses for today
+        wins_losses = self.db.conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN pnl_dollars > 0 THEN 1 ELSE 0 END) as wins, "
+            "  SUM(CASE WHEN pnl_dollars <= 0 THEN 1 ELSE 0 END) as losses "
+            "FROM trades WHERE exit_time LIKE ? AND is_open = 0",
+            (f"{today}%",)
+        ).fetchone()
+        wins = wins_losses["wins"] or 0 if wins_losses else 0
+        losses = wins_losses["losses"] or 0 if wins_losses else 0
 
         if trades_today > 0:
             self.telegram.notify_daily_summary({
                 "date": today,
                 "trades": trades_today,
-                "wins": 0,  # Could query from DB
-                "losses": 0,
+                "wins": wins,
+                "losses": losses,
                 "pnl_dollars": daily_pnl,
                 "balance": self.paper.balance,
             })
@@ -544,6 +610,8 @@ class TradingBot:
             # Save daily stats
             self.db.upsert_daily_stats(today, {
                 "trades_taken": trades_today,
+                "wins": wins,
+                "losses": losses,
                 "pnl_dollars": daily_pnl,
                 "balance_end": self.paper.balance,
             })
@@ -562,27 +630,34 @@ class TradingBot:
         logger.info("=" * 50)
 
     def _shutdown(self, signum=None, frame=None):
-        """Graceful shutdown handler."""
-        logger.info("Shutdown signal received...")
+        """
+        Graceful shutdown handler.
+        On SIGTERM (Railway restart/deploy): keep trades open in DB for restoration.
+        On SIGINT (manual stop): also keep trades open — session_end_close_all handles EOD.
+        """
+        sig_name = signal.Signals(signum).name if signum else "unknown"
+        logger.info("Shutdown signal received: %s", sig_name)
         self.running = False
 
-        # Close all trades
-        price = self.data.get_current_price()
-        if price:
-            exits = self.trade_mgr.session_end_close_all(price)
-            if exits:
-                self.paper.process_exits(exits)
+        open_count = self.trade_mgr.get_active_trade_count()
+        if open_count > 0:
+            logger.info("Preserving %d open trade(s) in DB for restart recovery", open_count)
+            self.telegram.notify_status({
+                "shutdown": True,
+                "open_trades_preserved": open_count,
+                "signal": sig_name,
+            })
 
         # Final status
         status = self.paper.get_status()
         self._log_status(status)
-        self.telegram.notify_status(status)
 
         # Learning report
         report = self.learner.get_learning_report()
-        self.telegram.notify_learning_report(report)
+        if report["trades_analyzed"] > 0:
+            self.telegram.notify_learning_report(report)
 
-        self.telegram.notify_shutdown("Signal received")
+        self.telegram.notify_shutdown(f"{sig_name} — {open_count} trades preserved")
         self.db.close()
 
 

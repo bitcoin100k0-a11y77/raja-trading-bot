@@ -171,11 +171,16 @@ class Strategy:
 
         br = body_ratio(o, c, h, l)
         if br < self.cfg.c1_body_min:
+            logger.debug("C1 scan: body_ratio %.2f < min %.2f, skip", br, self.cfg.c1_body_min)
             return  # Not enough body
 
         c1_range_pips = price_to_pips(h - l)
         if c1_range_pips < self.cfg.c1_min_range_pips:
+            logger.debug("C1 scan: range %.1f pips < min %.1f, skip", c1_range_pips, self.cfg.c1_min_range_pips)
             return  # Candle too small
+
+        logger.info("C1 candidate: O=%.2f H=%.2f L=%.2f C=%.2f | body=%.2f range=%.1f pips | %s",
+                     o, h, l, c, br, c1_range_pips, "BULL" if is_bullish(o, c) else "BEAR")
 
         # Check against support levels (bullish rejection)
         for level in market.support_levels:
