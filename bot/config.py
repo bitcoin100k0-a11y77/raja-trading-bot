@@ -35,7 +35,7 @@ class StrategyConfig:
     sr_scan_range: int = 400
     swing_lookback: int = 5
     sr_zone_tolerance: float = 4.0
-    min_touches: int = 3
+    min_touches: int = 2
     min_level_spacing: float = 5.0
     max_levels_per_side: int = 5
 
@@ -45,14 +45,14 @@ class StrategyConfig:
     rejection_tolerance: float = 4.0
     pending_expiry_bars: int = 4
 
-    # === IMPULSE ENTRY (DISABLED) ===
-    impulse_enabled: bool = False
+    # === IMPULSE ENTRY ===
+    impulse_enabled: bool = True
     impulse_min_body_ratio: float = 0.50
     impulse_volume_multiplier: float = 1.5
     impulse_clean_range_lookback: int = 5
 
-    # === BREAK & RETEST (DISABLED) ===
-    break_retest_enabled: bool = False
+    # === BREAK & RETEST ===
+    break_retest_enabled: bool = True
     break_confirmation_pips: float = 5.0
     retest_max_bars: int = 8
 
@@ -86,8 +86,8 @@ class StrategyConfig:
     # === SESSION FILTER (UTC hours) ===
     session_start: int = 8
     session_end: int = 21
-    session_blackout_start: int = 13
-    session_blackout_end: int = 16
+    session_blackout_start: int = 0
+    session_blackout_end: int = 0
 
 
 @dataclass
@@ -163,8 +163,12 @@ class BotConfig:
         cfg.strategy.max_risk_pips = _env_float("MAX_RISK_PIPS", 55.0)
         cfg.strategy.session_start = _env_int("SESSION_START", 8)
         cfg.strategy.session_end = _env_int("SESSION_END", 21)
-        cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 13)
-        cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 16)
+        cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 0)
+        cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 0)
+
+        # Entry types
+        cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", True)
+        cfg.strategy.break_retest_enabled = _env_bool("BREAK_RETEST_ENABLED", True)
 
         # Trailing stop
         cfg.strategy.trailing_enabled = _env_bool("TRAILING_ENABLED", True)

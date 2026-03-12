@@ -17,7 +17,10 @@ class TradingDatabase:
     """SQLite database for trade journal, loss analysis, and adaptive learning."""
 
     def __init__(self, db_path: str = "data/trading_bot.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        if db_path != ":memory:":
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
