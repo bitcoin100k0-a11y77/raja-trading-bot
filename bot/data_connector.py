@@ -375,7 +375,15 @@ class DataConnector:
     """
     Multi-source data connector with automatic failover.
     Tries sources in priority order: TwelveData → Yahoo → AlphaVantage.
+
+    Smart caching: Only fetches fresh data when a new candle is expected
+    (every 15 min for M15), reducing API usage from ~2880/day to ~96/day.
     """
+
+    # Map timeframe string to candle duration in minutes
+    TIMEFRAME_MINUTES = {
+        "15m": 15, "1h": 60, "4h": 240, "1d": 1440,
+    }
 
     def __init__(self, symbol: str = "GC=F", timeframe: str = "15m",
                  cache_minutes: float = 0.33):
@@ -383,6 +391,7 @@ class DataConnector:
         self.symbol = "XAU/USD"
         self.timeframe = timeframe
         self.cache_minutes = cache_minutes
+        self._candle_minutes = self.TIMEFRAME_MINUTES.get(timeframe, 15)
 
         # Caches
         self._cache: Optional[pd.DataFrame] = None
@@ -452,15 +461,65 @@ class DataConnector:
             raise last_error
         raise ValueError("No data sources available")
 
+    def _is_new_candle_expected(self) -> bool:
+        """
+        Check if a new candle should have formed since last fetch.
+        Returns True if we've crossed a candle boundary (e.g. minute 0/15/30/45
+        for M15), meaning fresh data is needed.
+
+        Logic:
+        - If cache was populated in an earlier candle period → fetch (new candle)
+        - If cache was populated in current candle period → reuse cache
+        - 90s grace after boundary before first fetch (let candle data settle)
+        """
+        if self._cache is None or self._cache_time is None:
+            return True  # No cache, must fetch
+
+        now = datetime.now(timezone.utc)
+        cache_time = self._cache_time
+
+        # Different day = definitely new candle
+        if now.date() != cache_time.date():
+            return True
+
+        # Calculate candle boundaries (e.g. for M15: :00, :15, :30, :45)
+        now_minutes = now.hour * 60 + now.minute
+        cache_minutes = cache_time.hour * 60 + cache_time.minute
+
+        now_boundary = (now_minutes // self._candle_minutes) * self._candle_minutes
+        cache_boundary = (cache_minutes // self._candle_minutes) * self._candle_minutes
+
+        if now_boundary > cache_boundary:
+            # We've crossed into a new candle period since last fetch.
+            # Wait 90s after boundary for the candle data to finalize on the API.
+            seconds_into_candle = (now_minutes - now_boundary) * 60 + now.second
+            if seconds_into_candle < 90:
+                logger.debug("New candle boundary crossed but waiting for data to settle "
+                             "(%.0fs into candle, need 90s)", seconds_into_candle)
+                return False  # Too early, data may not be ready yet
+            return True  # New candle data should be available now
+
+        # Same candle period — cache is still valid
+        return False
+
     def fetch_bars(self, lookback_days: int = 7,
                    min_bars: int = 0,
                    use_cache: bool = True) -> pd.DataFrame:
-        """Fetch M15 bars with failover and caching."""
-        # Check cache
+        """
+        Fetch M15 bars with failover and SMART candle-aware caching.
+
+        Instead of fetching every 30s (2880 calls/day), only fetches when
+        a new candle boundary is crossed (~96 calls/day for M15).
+        Between candles, returns cached data for trade management.
+        """
+        # Smart cache: reuse cached data unless a new candle is expected
         if use_cache and self._cache is not None and self._cache_time:
-            age = (datetime.now(timezone.utc) - self._cache_time).total_seconds()
-            if age < self.cache_minutes * 60:
+            if not self._is_new_candle_expected():
+                age = (datetime.now(timezone.utc) - self._cache_time).total_seconds()
+                logger.debug("Using cached data (age: %.0fs, next candle not due yet)", age)
                 return self._cache.copy()
+
+        logger.info("New candle expected — fetching fresh data from API")
 
         # Calculate bars needed (~88 M15 bars per trading day)
         bars_needed = max(min_bars, int(lookback_days * 88))
