@@ -142,143 +142,194 @@ class MarketAnalyzer:
 
         return trend, recent_highs, recent_lows
 
-    # === S/R DETECTION PIPELINE (Raja's 5 steps) ===
+    # === S/R CHANNEL DETECTION (LonesomeTheBlue method) ===
 
     def _detect_sr_levels(self, df: pd.DataFrame, current_price: float,
                           htf_df: Optional[pd.DataFrame] = None
                           ) -> Tuple[List[SRLevel], List[SRLevel]]:
         """
-        Raja Banks S/R Detection Pipeline:
-        1. Find swing highs/lows
-        2. Cluster nearby swings ($3 tolerance)
-        3. Filter by touch count
-        4. Enforce minimum spacing
-        5. Cap max levels per side
+        S/R Channel Detection (LonesomeTheBlue method).
+        Replaces old swing-clustering with institutional-style channel zones:
+        1. Detect pivot highs/lows with configurable lookback
+        2. Group nearby pivots into channels within max width % of price range
+        3. Score each channel by bar touches (strength)
+        4. Greedy strongest-first selection up to max_channels
+        5. Classify as support/resistance relative to current price
         + HTF zone stacking bonus
         """
-        scan = min(self.cfg.sr_scan_range, len(df))
+        scan = min(self.cfg.sr_loopback, len(df))
+        if scan < self.cfg.pivot_period * 2 + 1:
+            return [], []
+
         recent = df.tail(scan)
         highs = recent["High"].values
         lows = recent["Low"].values
+        closes = recent["Close"].values
+        n = len(highs)
 
-        # Step 1: Find swing points
-        sh_idx = detect_swing_highs(highs, self.cfg.swing_lookback)
-        sl_idx = detect_swing_lows(lows, self.cfg.swing_lookback)
+        # Step 1: Detect pivots
+        pivot_vals = self._detect_pivots(highs, lows, self.cfg.pivot_period)
 
-        swing_highs = [float(highs[i]) for i in sh_idx]
-        swing_lows = [float(lows[i]) for i in sl_idx]
-
-        all_swings = swing_highs + swing_lows
-
-        if not all_swings:
+        if len(pivot_vals) == 0:
             return [], []
 
-        # Step 2: Cluster nearby swings
-        clusters = self._cluster_levels(all_swings, self.cfg.sr_zone_tolerance)
+        # Calculate max channel width (% of 300-bar range)
+        range_bars = min(300, n)
+        prdhighest = float(highs[-range_bars:].max())
+        prdlowest = float(lows[-range_bars:].min())
+        cwidth = (prdhighest - prdlowest) * self.cfg.channel_width_pct / 100.0
 
-        # Step 3: Filter by touch count
-        filtered = [c for c in clusters if c["touches"] >= self.cfg.min_touches]
+        if cwidth <= 0:
+            return [], []
+
+        # Step 2: Build channel for each pivot
+        supres = []
+        for x in range(len(pivot_vals)):
+            hi, lo, strength = self._build_sr_channel(x, pivot_vals, cwidth)
+            supres.append([float(strength), float(hi), float(lo)])
+
+        # Step 3: Add bar-touch strength (vectorized for speed)
+        supres_arr = np.array(supres)  # shape: (num_pivots, 3) = [strength, hi, lo]
+        for x in range(len(supres)):
+            h_val = supres[x][1]
+            l_val = supres[x][2]
+            # Count bars whose high or low falls within [lo, hi] channel
+            high_in = (highs <= h_val) & (highs >= l_val)
+            low_in = (lows <= h_val) & (lows >= l_val)
+            s = int(np.sum(high_in | low_in))
+            supres[x][0] += s
+
+        # Step 4: Greedy strongest-first selection
+        sr_zones = []
+        min_score = self.cfg.sr_min_strength * 20
+
+        for _ in range(min(10, self.cfg.sr_max_channels)):
+            best_score = -1.0
+            best_idx = -1
+            for y in range(len(supres)):
+                if supres[y][0] > best_score and supres[y][0] >= min_score:
+                    best_score = supres[y][0]
+                    best_idx = y
+
+            if best_idx < 0:
+                break
+
+            hh = supres[best_idx][1]
+            ll = supres[best_idx][2]
+            sr_zones.append((hh, ll, best_score))
+
+            # Zero out overlapping channels
+            for y in range(len(supres)):
+                if (supres[y][1] <= hh and supres[y][1] >= ll) or \
+                   (supres[y][2] <= hh and supres[y][2] >= ll):
+                    supres[y][0] = -1
+
+        # Step 5: Sort by strength and classify
+        sr_zones.sort(key=lambda z: z[2], reverse=True)
+        sr_zones = sr_zones[:self.cfg.sr_max_channels]
 
         # HTF zone stacking
         htf_levels = []
         if htf_df is not None and not htf_df.empty:
             htf_levels = self._get_htf_levels(htf_df)
 
-        # Split into support / resistance relative to current price
         support = []
         resistance = []
 
-        for c in filtered:
-            level_price = c["price"]
-            touches = c["touches"]
+        for hi, lo, score in sr_zones:
+            mid = (hi + lo) / 2.0
+            touches = max(1, int(score // 20))  # Approximate pivot count
 
             # Check HTF alignment
             htf_aligned = any(
-                abs(level_price - hl) <= self.cfg.sr_zone_tolerance
+                abs(mid - hl) <= self.cfg.sr_zone_tolerance
                 for hl in htf_levels
             )
+            strength = score + (40.0 if htf_aligned else 0.0)
 
-            strength = touches + (2.0 if htf_aligned else 0.0)
-
-            if level_price < current_price:
+            if hi < current_price and lo < current_price:
                 support.append(SRLevel(
-                    price=level_price,
+                    price=mid,
                     zone_type=ZoneType.SUPPORT,
                     touches=touches,
                     htf_aligned=htf_aligned,
                     strength=strength,
                 ))
-            else:
+            elif hi > current_price and lo > current_price:
                 resistance.append(SRLevel(
-                    price=level_price,
+                    price=mid,
                     zone_type=ZoneType.RESISTANCE,
                     touches=touches,
                     htf_aligned=htf_aligned,
                     strength=strength,
                 ))
+            else:
+                # Price inside zone — classify by midpoint
+                if mid > current_price:
+                    resistance.append(SRLevel(
+                        price=mid,
+                        zone_type=ZoneType.RESISTANCE,
+                        touches=touches,
+                        htf_aligned=htf_aligned,
+                        strength=strength,
+                    ))
+                else:
+                    support.append(SRLevel(
+                        price=mid,
+                        zone_type=ZoneType.SUPPORT,
+                        touches=touches,
+                        htf_aligned=htf_aligned,
+                        strength=strength,
+                    ))
 
-        # Step 4: Enforce minimum spacing
-        support = self._enforce_spacing(support, ascending=False)
-        resistance = self._enforce_spacing(resistance, ascending=True)
-
-        # Step 5: Cap max levels per side
-        support.sort(key=lambda x: x.price, reverse=True)  # Nearest first
-        resistance.sort(key=lambda x: x.price)  # Nearest first
-        support = support[:self.cfg.max_levels_per_side]
-        resistance = resistance[:self.cfg.max_levels_per_side]
+        support.sort(key=lambda x: x.price, reverse=True)   # Nearest first
+        resistance.sort(key=lambda x: x.price)               # Nearest first
 
         return support, resistance
 
-    def _cluster_levels(self, prices: List[float],
-                        tolerance: float) -> List[Dict]:
+    @staticmethod
+    def _detect_pivots(highs: np.ndarray, lows: np.ndarray,
+                       prd: int) -> List[float]:
         """
-        Cluster nearby price levels within $tolerance.
-        Returns list of {price: avg_price, touches: count}.
+        Detect pivot high/low values (equivalent to ta.pivothigh/ta.pivotlow).
+        A pivot high at bar i requires high[i] to be highest of bars [i-prd, i+prd].
+        A pivot low at bar i requires low[i] to be lowest of bars [i-prd, i+prd].
         """
-        if not prices:
-            return []
+        n = len(highs)
+        pivots = []
+        for i in range(prd, n - prd):
+            window_h = highs[i - prd:i + prd + 1]
+            if highs[i] >= window_h.max():
+                pivots.append(float(highs[i]))
 
-        sorted_prices = sorted(prices)
-        clusters = []
-        current_cluster = [sorted_prices[0]]
+            window_l = lows[i - prd:i + prd + 1]
+            if lows[i] <= window_l.min():
+                pivots.append(float(lows[i]))
 
-        for p in sorted_prices[1:]:
-            if p - current_cluster[-1] <= tolerance:
-                current_cluster.append(p)
-            else:
-                clusters.append({
-                    "price": round(np.mean(current_cluster), 2),
-                    "touches": len(current_cluster),
-                })
-                current_cluster = [p]
+        return pivots
 
-        # Don't forget last cluster
-        clusters.append({
-            "price": round(np.mean(current_cluster), 2),
-            "touches": len(current_cluster),
-        })
+    @staticmethod
+    def _build_sr_channel(pivot_idx: int, pivot_vals: List[float],
+                          max_channel_width: float) -> Tuple[float, float, int]:
+        """
+        Build an S/R channel around a pivot by absorbing nearby pivots.
+        Returns (channel_hi, channel_lo, pivot_count_score).
+        """
+        lo = pivot_vals[pivot_idx]
+        hi = lo
+        numpp = 0
 
-        return clusters
+        for y in range(len(pivot_vals)):
+            cpp = pivot_vals[y]
+            wdth = (hi - cpp) if cpp <= hi else (cpp - lo)
+            if wdth <= max_channel_width:
+                if cpp <= hi:
+                    lo = min(lo, cpp)
+                else:
+                    hi = max(hi, cpp)
+                numpp += 20
 
-    def _enforce_spacing(self, levels: List[SRLevel],
-                         ascending: bool = True) -> List[SRLevel]:
-        """Remove levels that are too close together, keeping stronger ones."""
-        if len(levels) <= 1:
-            return levels
-
-        # Sort by strength (strongest first), then filter by spacing
-        levels.sort(key=lambda x: x.strength, reverse=True)
-        filtered = [levels[0]]
-
-        for lvl in levels[1:]:
-            too_close = any(
-                abs(lvl.price - kept.price) < self.cfg.min_level_spacing
-                for kept in filtered
-            )
-            if not too_close:
-                filtered.append(lvl)
-
-        return filtered
+        return hi, lo, numpp
 
     def _get_htf_levels(self, htf_df: pd.DataFrame) -> List[float]:
         """Extract key levels from higher timeframe data."""

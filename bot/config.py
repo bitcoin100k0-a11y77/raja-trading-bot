@@ -31,19 +31,26 @@ class StrategyConfig:
     pip_size: float = 0.10
     pip_value_per_lot: float = 10.0
 
-    # === S/R DETECTION PIPELINE ===
-    sr_scan_range: int = 400
-    swing_lookback: int = 5
-    sr_zone_tolerance: float = 4.0
-    min_touches: int = 2
-    min_level_spacing: float = 5.0
-    max_levels_per_side: int = 5
+    # === S/R CHANNEL DETECTION (LonesomeTheBlue method) ===
+    pivot_period: int = 10          # Lookback/lookforward bars for pivot detection
+    channel_width_pct: float = 5.0  # Max channel width as % of 300-bar range
+    sr_min_strength: int = 1        # Min pivot count per channel
+    sr_max_channels: int = 6        # Max S/R channels to detect
+    sr_loopback: int = 290          # Bars to scan for pivots
+
+    # Legacy aliases (kept for backward compat with existing code paths)
+    swing_lookback: int = 10
+    sr_zone_tolerance: float = 3.0
+    sr_scan_range: int = 290
+    min_touches: int = 1
+    min_level_spacing: float = 0.0
+    max_levels_per_side: int = 6
 
     # === C1/C0 REJECTION ENTRY ===
-    c1_body_min: float = 0.35
-    c1_min_range_pips: float = 8.0
-    rejection_tolerance: float = 4.0
-    pending_expiry_bars: int = 4
+    c1_body_min: float = 0.30
+    c1_min_range_pips: float = 0.0
+    rejection_tolerance: float = 3.0
+    pending_expiry_bars: int = 3
 
     # === IMPULSE ENTRY ===
     impulse_enabled: bool = True
@@ -57,15 +64,15 @@ class StrategyConfig:
     retest_max_bars: int = 8
 
     # === PRE-ENTRY FILTERS ===
-    min_room_pips: float = 25.0
-    min_sr_gap_pips: float = 15.0
+    min_room_pips: float = 30.0
+    min_sr_gap_pips: float = 20.0
     max_mid_range_pct: float = 0.35
-    min_sl_pips: float = 20.0
-    max_risk_pips: float = 55.0
+    min_sl_pips: float = 5.0
+    max_risk_pips: float = 300.0
     max_spread_pips: float = 10.0
 
     # === STOP LOSS STAGES ===
-    sl_stage2_pips: float = 25.0
+    sl_stage2_pips: float = 20.0
     sl_stage3_pips: float = 40.0
 
     # === TRAILING STOP (after Stage 3 / breakeven) ===
@@ -79,13 +86,13 @@ class StrategyConfig:
     tp2_max_rr: float = 2.5
 
     # === SPECIAL EXITS ===
-    giveback_trigger_pips: float = 20.0
+    giveback_trigger_pips: float = 30.0
     giveback_close_pct: float = 0.50
-    small_body_threshold: float = 0.30
+    small_body_threshold: float = 0.35
 
     # === SESSION FILTER (UTC hours) ===
-    session_start: int = 8
-    session_end: int = 21
+    session_start: int = 6
+    session_end: int = 22
     session_blackout_start: int = 0
     session_blackout_end: int = 0
 
@@ -99,7 +106,7 @@ class RiskConfig:
     risk_reduction_increment: float = 0.5
     risk_recovery_increment: float = 0.25
     max_trades_per_day: int = 3
-    daily_loss_limit: float = 3.0
+    daily_loss_limit: float = 4.0
     cooldown_bars: int = 4
     second_chance_risk_pct: float = 1.2
 
@@ -159,10 +166,17 @@ class BotConfig:
         # Strategy
         cfg.strategy.symbol = _env("SYMBOL", "GC=F")
         cfg.strategy.timeframe = _env("TIMEFRAME", "15m")
-        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 20.0)
-        cfg.strategy.max_risk_pips = _env_float("MAX_RISK_PIPS", 55.0)
-        cfg.strategy.session_start = _env_int("SESSION_START", 8)
-        cfg.strategy.session_end = _env_int("SESSION_END", 21)
+        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 5.0)
+        cfg.strategy.max_risk_pips = _env_float("MAX_RISK_PIPS", 300.0)
+        cfg.strategy.session_start = _env_int("SESSION_START", 6)
+        cfg.strategy.session_end = _env_int("SESSION_END", 22)
+
+        # S/R Channel Detection
+        cfg.strategy.pivot_period = _env_int("PIVOT_PERIOD", 10)
+        cfg.strategy.channel_width_pct = _env_float("CHANNEL_WIDTH_PCT", 5.0)
+        cfg.strategy.sr_min_strength = _env_int("SR_MIN_STRENGTH", 1)
+        cfg.strategy.sr_max_channels = _env_int("SR_MAX_CHANNELS", 6)
+        cfg.strategy.sr_loopback = _env_int("SR_LOOPBACK", 290)
         cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 0)
         cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 0)
 
@@ -178,7 +192,7 @@ class BotConfig:
         # Risk
         cfg.risk.risk_percent = _env_float("RISK_PERCENT", 1.0)
         cfg.risk.max_trades_per_day = _env_int("MAX_TRADES_PER_DAY", 3)
-        cfg.risk.daily_loss_limit = _env_float("DAILY_LOSS_LIMIT", 3.0)
+        cfg.risk.daily_loss_limit = _env_float("DAILY_LOSS_LIMIT", 4.0)
 
         # Telegram
         cfg.telegram.enabled = _env_bool("TELEGRAM_ENABLED", False)

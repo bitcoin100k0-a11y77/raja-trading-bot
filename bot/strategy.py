@@ -182,56 +182,67 @@ class Strategy:
         logger.info("C1 candidate: O=%.2f H=%.2f L=%.2f C=%.2f | body=%.2f range=%.1f pips | %s",
                      o, h, l, c, br, c1_range_pips, "BULL" if is_bullish(o, c) else "BEAR")
 
-        # Check against support levels (bullish rejection)
-        for level in market.support_levels:
-            if abs(l - level.price) <= self.cfg.rejection_tolerance:
-                if is_bullish(o, c):
-                    # C1 bullish rejection at support
-                    entry = h  # Pending buy stop above C1 high
-                    sl = l - pips_to_price(5)  # Below C1 low + 5 pip buffer
+        tol = self.cfg.rejection_tolerance
 
-                    pending = PendingC0(
-                        c1_bar_index=len(df) - 1,
-                        direction=TradeDirection.BUY,
-                        entry_price=entry,
-                        sl_price=sl,
-                        sr_level=level,
-                        context={
-                            "c1_body_ratio": br,
-                            "c1_range_pips": c1_range_pips,
-                            "c1_open": o, "c1_high": h,
-                            "c1_low": l, "c1_close": c,
-                            "c1_is_wickless": is_wickless(o, c, h, l),
-                        }
-                    )
-                    self.pending_orders.append(pending)
-                    logger.info("C1 bullish rejection at support %.2f, pending buy stop at %.2f",
-                                level.price, entry)
+        # Check against support levels (bullish rejection) — asymmetric tolerance
+        # Wick must dip INTO the support zone: C1_low within [level - tol*2, level + tol]
+        # Body must close above level (rejection = bullish close away from zone)
+        if is_bullish(o, c):
+            for level in sorted(market.support_levels, key=lambda x: x.price, reverse=True):
+                if l <= level.price + tol and l >= level.price - tol * 2:
+                    body_bottom = min(o, c)
+                    if body_bottom > level.price - tol * 0.5:
+                        entry = h  # Pending buy stop above C1 high
+                        sl = l  # SL at C1 low (no buffer — matches backtest)
 
-        # Check against resistance levels (bearish rejection)
-        for level in market.resistance_levels:
-            if abs(h - level.price) <= self.cfg.rejection_tolerance:
-                if is_bearish(o, c):
-                    entry = l  # Pending sell stop below C1 low
-                    sl = h + pips_to_price(5)  # Above C1 high + 5 pip buffer
+                        pending = PendingC0(
+                            c1_bar_index=len(df) - 1,
+                            direction=TradeDirection.BUY,
+                            entry_price=entry,
+                            sl_price=sl,
+                            sr_level=level,
+                            context={
+                                "c1_body_ratio": br,
+                                "c1_range_pips": c1_range_pips,
+                                "c1_open": o, "c1_high": h,
+                                "c1_low": l, "c1_close": c,
+                                "c1_is_wickless": is_wickless(o, c, h, l),
+                            }
+                        )
+                        self.pending_orders.append(pending)
+                        logger.info("C1 bullish rejection at support %.2f, pending buy stop at %.2f",
+                                    level.price, entry)
+                        break  # Only take first matching level (nearest)
 
-                    pending = PendingC0(
-                        c1_bar_index=len(df) - 1,
-                        direction=TradeDirection.SELL,
-                        entry_price=entry,
-                        sl_price=sl,
-                        sr_level=level,
-                        context={
-                            "c1_body_ratio": br,
-                            "c1_range_pips": c1_range_pips,
-                            "c1_open": o, "c1_high": h,
-                            "c1_low": l, "c1_close": c,
-                            "c1_is_wickless": is_wickless(o, c, h, l),
-                        }
-                    )
-                    self.pending_orders.append(pending)
-                    logger.info("C1 bearish rejection at resistance %.2f, pending sell stop at %.2f",
-                                level.price, entry)
+        # Check against resistance levels (bearish rejection) — asymmetric tolerance
+        # Wick must poke INTO resistance zone: C1_high within [level - tol, level + tol*2]
+        # Body must close below level (rejection = bearish close away from zone)
+        if is_bearish(o, c):
+            for level in sorted(market.resistance_levels, key=lambda x: x.price):
+                if h >= level.price - tol and h <= level.price + tol * 2:
+                    body_top = max(o, c)
+                    if body_top < level.price + tol * 0.5:
+                        entry = l  # Pending sell stop below C1 low
+                        sl = h  # SL at C1 high (no buffer — matches backtest)
+
+                        pending = PendingC0(
+                            c1_bar_index=len(df) - 1,
+                            direction=TradeDirection.SELL,
+                            entry_price=entry,
+                            sl_price=sl,
+                            sr_level=level,
+                            context={
+                                "c1_body_ratio": br,
+                                "c1_range_pips": c1_range_pips,
+                                "c1_open": o, "c1_high": h,
+                                "c1_low": l, "c1_close": c,
+                                "c1_is_wickless": is_wickless(o, c, h, l),
+                            }
+                        )
+                        self.pending_orders.append(pending)
+                        logger.info("C1 bearish rejection at resistance %.2f, pending sell stop at %.2f",
+                                    level.price, entry)
+                        break  # Only take first matching level (nearest)
 
     def _check_pending_c0(self, bar: pd.Series, df: pd.DataFrame,
                           market: MarketState) -> List[Signal]:
@@ -546,22 +557,13 @@ class Strategy:
             logger.debug("Rejected: SL too wide %.1f pips", signal.risk_pips)
             return False
 
-        # 4. Prefer HTF-aligned levels (bonus, not hard filter)
-        # Only reject if both: no HTF alignment AND very few touches
-        if not signal.sr_level.htf_aligned and signal.sr_level.touches < 2:
-            logger.debug("Rejected: S/R not HTF-aligned and < 2 touches")
+        # 4. HTF alignment bonus (soft filter) — channel method already
+        # selects strong zones, so we only reject truly weak channels
+        # with no HTF alignment AND very low strength score
+        if not signal.sr_level.htf_aligned and signal.sr_level.strength < 20:
+            logger.debug("Rejected: S/R channel too weak (strength=%.1f, no HTF)",
+                         signal.sr_level.strength)
             return False
-
-        # 5. Counter-trend filter: require stronger evidence for clear trends
-        from constants import TrendType
-        if signal.direction == TradeDirection.BUY and market.trend == TrendType.DOWNTREND:
-            if signal.sr_level.touches < 3:
-                logger.debug("Rejected: counter-trend buy needs 3+ touches")
-                return False
-        if signal.direction == TradeDirection.SELL and market.trend == TrendType.UPTREND:
-            if signal.sr_level.touches < 3:
-                logger.debug("Rejected: counter-trend sell needs 3+ touches")
-                return False
 
         return True
 

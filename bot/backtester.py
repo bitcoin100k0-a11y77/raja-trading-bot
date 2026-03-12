@@ -276,12 +276,17 @@ class Backtester:
             print("Blackout: None")
         print("-" * 60)
 
+        # Pre-compute session hours for fast lookup
+        session_start = self.cfg.strategy.session_start
+        session_end = self.cfg.strategy.session_end
+        analysis_lookback = max(self.cfg.strategy.sr_loopback, 300) + 50
+        cached_market = None
+        cache_bar = -999  # Force first computation
+
         # Bar-by-bar replay (start at bar 50 to have enough lookback)
         for i in range(50, len(df)):
             self._bar_count = i - 50
 
-            # Slice data up to current bar (the strategy only sees past data)
-            current_df = df.iloc[:i + 1].copy()
             bar = df.iloc[i]
 
             # Set simulated time for utils.utc_now()
@@ -312,18 +317,27 @@ class Backtester:
                 self._process_exit(event, bar_time)
 
             # 2. Skip signal generation outside session
-            if not is_tradeable_session(utc_hour, self.cfg.strategy.session_start,
-                                        self.cfg.strategy.session_end):
+            if not is_tradeable_session(utc_hour, session_start, session_end):
                 # Session end close
                 session_exits = self.trade_mgr.session_end_close_all(c)
                 for event in session_exits:
                     self._process_exit(event, bar_time)
                 continue
 
-            # 3. Market analysis
-            market = self.analyzer.analyze(current_df, htf_df, c)
+            # 3. Market analysis — use tail slice (no copy), cache every 4 bars
+            if i - cache_bar >= 4 or cached_market is None:
+                tail_start = max(0, i + 1 - analysis_lookback)
+                current_df = df.iloc[tail_start:i + 1]
+                cached_market = self.analyzer.analyze(current_df, htf_df, c)
+                cache_bar = i
+            else:
+                # Update just the price on cached market
+                cached_market.current_price = c
+            market = cached_market
 
-            # 4. Generate signals
+            # 4. Generate signals — use tail slice for strategy
+            tail_start = max(0, i + 1 - analysis_lookback)
+            current_df = df.iloc[tail_start:i + 1]
             signals = self.strategy.generate_signals(current_df, market)
 
             # 5. Execute signals
@@ -813,7 +827,9 @@ def main():
         "avg_win_rr": round(result.avg_rr, 2),
         "config": {
             "risk_percent": config.risk.risk_percent,
-            "min_touches": config.strategy.min_touches,
+            "pivot_period": config.strategy.pivot_period,
+            "channel_width_pct": config.strategy.channel_width_pct,
+            "sr_max_channels": config.strategy.sr_max_channels,
             "impulse_enabled": config.strategy.impulse_enabled,
             "break_retest_enabled": config.strategy.break_retest_enabled,
             "session_start": config.strategy.session_start,
