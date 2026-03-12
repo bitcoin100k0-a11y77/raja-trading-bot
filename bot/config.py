@@ -59,7 +59,7 @@ class StrategyConfig:
     impulse_clean_range_lookback: int = 5
 
     # === BREAK & RETEST ===
-    break_retest_enabled: bool = True
+    break_retest_enabled: bool = False
     break_confirmation_pips: float = 5.0
     retest_max_bars: int = 8
 
@@ -93,8 +93,8 @@ class StrategyConfig:
     # === SESSION FILTER (UTC hours) ===
     session_start: int = 6
     session_end: int = 22
-    session_blackout_start: int = 0
-    session_blackout_end: int = 0
+    session_blackout_start: int = 11
+    session_blackout_end: int = 14
 
 
 @dataclass
@@ -177,12 +177,12 @@ class BotConfig:
         cfg.strategy.sr_min_strength = _env_int("SR_MIN_STRENGTH", 1)
         cfg.strategy.sr_max_channels = _env_int("SR_MAX_CHANNELS", 6)
         cfg.strategy.sr_loopback = _env_int("SR_LOOPBACK", 290)
-        cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 0)
-        cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 0)
+        cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 11)
+        cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 14)
 
         # Entry types
         cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", True)
-        cfg.strategy.break_retest_enabled = _env_bool("BREAK_RETEST_ENABLED", True)
+        cfg.strategy.break_retest_enabled = _env_bool("BREAK_RETEST_ENABLED", False)
 
         # Trailing stop
         cfg.strategy.trailing_enabled = _env_bool("TRAILING_ENABLED", True)
