@@ -53,7 +53,7 @@ class StrategyConfig:
     pending_expiry_bars: int = 3
 
     # === IMPULSE ENTRY ===
-    impulse_enabled: bool = True
+    impulse_enabled: bool = False
     impulse_min_body_ratio: float = 0.50
     impulse_volume_multiplier: float = 1.5
     impulse_clean_range_lookback: int = 5
@@ -186,7 +186,7 @@ class BotConfig:
         cfg.strategy.max_mid_range_pct = _env_float("MAX_MID_RANGE_PCT", 0.50)
 
         # Entry types
-        cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", True)
+        cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", False)
         cfg.strategy.break_retest_enabled = _env_bool("BREAK_RETEST_ENABLED", False)
 
         # Trailing stop
