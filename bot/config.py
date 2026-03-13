@@ -49,7 +49,7 @@ class StrategyConfig:
     # === C1/C0 REJECTION ENTRY ===
     c1_body_min: float = 0.30
     c1_min_range_pips: float = 0.0
-    rejection_tolerance: float = 3.0
+    rejection_tolerance: float = 8.0   # $8 tolerance — gold M15 candles range $5-15
     pending_expiry_bars: int = 3
 
     # === IMPULSE ENTRY ===
@@ -64,9 +64,9 @@ class StrategyConfig:
     retest_max_bars: int = 8
 
     # === PRE-ENTRY FILTERS ===
-    min_room_pips: float = 30.0
+    min_room_pips: float = 15.0     # $1.5 room to opposing S/R (was $3, too tight)
     min_sr_gap_pips: float = 20.0
-    max_mid_range_pct: float = 0.35
+    max_mid_range_pct: float = 0.50  # 50% dead zone (was 35%, too restrictive)
     min_sl_pips: float = 5.0
     max_risk_pips: float = 300.0
     max_spread_pips: float = 10.0
@@ -179,6 +179,11 @@ class BotConfig:
         cfg.strategy.sr_loopback = _env_int("SR_LOOPBACK", 290)
         cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 11)
         cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 14)
+
+        # Entry params
+        cfg.strategy.rejection_tolerance = _env_float("REJECTION_TOLERANCE", 8.0)
+        cfg.strategy.min_room_pips = _env_float("MIN_ROOM_PIPS", 15.0)
+        cfg.strategy.max_mid_range_pct = _env_float("MAX_MID_RANGE_PCT", 0.50)
 
         # Entry types
         cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", True)

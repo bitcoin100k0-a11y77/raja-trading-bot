@@ -188,10 +188,17 @@ class Strategy:
         # Wick must dip INTO the support zone: C1_low within [level - tol*2, level + tol]
         # Body must close above level (rejection = bullish close away from zone)
         if is_bullish(o, c):
+            logger.info("C1 scan: checking %d support levels (tol=$%.1f)", len(market.support_levels), tol)
             for level in sorted(market.support_levels, key=lambda x: x.price, reverse=True):
-                if l <= level.price + tol and l >= level.price - tol * 2:
+                wick_ok = l <= level.price + tol and l >= level.price - tol * 2
+                logger.debug("  SUP $%.2f: low=$%.2f, range=[%.2f, %.2f], wick_ok=%s",
+                             level.price, l, level.price - tol * 2, level.price + tol, wick_ok)
+                if wick_ok:
                     body_bottom = min(o, c)
-                    if body_bottom > level.price - tol * 0.5:
+                    body_ok = body_bottom > level.price - tol * 0.5
+                    logger.info("  SUP $%.2f: wick IN zone! body_bottom=$%.2f, need>$%.2f, body_ok=%s",
+                                level.price, body_bottom, level.price - tol * 0.5, body_ok)
+                    if body_ok:
                         entry = h  # Pending buy stop above C1 high
                         sl = l  # SL at C1 low (no buffer — matches backtest)
 
@@ -218,10 +225,17 @@ class Strategy:
         # Wick must poke INTO resistance zone: C1_high within [level - tol, level + tol*2]
         # Body must close below level (rejection = bearish close away from zone)
         if is_bearish(o, c):
+            logger.info("C1 scan: checking %d resistance levels (tol=$%.1f)", len(market.resistance_levels), tol)
             for level in sorted(market.resistance_levels, key=lambda x: x.price):
-                if h >= level.price - tol and h <= level.price + tol * 2:
+                wick_ok = h >= level.price - tol and h <= level.price + tol * 2
+                logger.debug("  RES $%.2f: high=$%.2f, range=[%.2f, %.2f], wick_ok=%s",
+                             level.price, h, level.price - tol, level.price + tol * 2, wick_ok)
+                if wick_ok:
                     body_top = max(o, c)
-                    if body_top < level.price + tol * 0.5:
+                    body_ok = body_top < level.price + tol * 0.5
+                    logger.info("  RES $%.2f: wick IN zone! body_top=$%.2f, need<$%.2f, body_ok=%s",
+                                level.price, body_top, level.price + tol * 0.5, body_ok)
+                    if body_ok:
                         entry = l  # Pending sell stop below C1 low
                         sl = h  # SL at C1 high (no buffer — matches backtest)
 
@@ -318,6 +332,7 @@ class Strategy:
         - Clean range to the left (no congestion)
         """
         if market.trend == TrendType.CONSOLIDATION:
+            logger.debug("Impulse scan: skipping — market in consolidation")
             return None
 
         o, h, l, c = float(bar["Open"]), float(bar["High"]), \
@@ -325,13 +340,15 @@ class Strategy:
 
         br = body_ratio(o, c, h, l)
         if br < self.cfg.impulse_min_body_ratio:
+            logger.debug("Impulse scan: body_ratio %.2f < min %.2f", br, self.cfg.impulse_min_body_ratio)
             return None
 
-        # Volume check
+        # Volume check — skip filter when no real volume data (common for gold on TwelveData)
         if "Volume" in df.columns:
             vol = float(bar["Volume"])
             vol_sma = float(df["Volume"].tail(20).mean())
-            if vol_sma > 0 and vol < vol_sma * self.cfg.impulse_volume_multiplier:
+            if vol_sma > 0 and vol > 0 and vol < vol_sma * self.cfg.impulse_volume_multiplier:
+                logger.debug("Impulse scan: volume %.0f < SMA*%.1f (%.0f)", vol, self.cfg.impulse_volume_multiplier, vol_sma * self.cfg.impulse_volume_multiplier)
                 return None
             vol_ratio = vol / vol_sma if vol_sma > 0 else 1.0
         else:
@@ -532,8 +549,8 @@ class Strategy:
             market.support_levels, market.resistance_levels
         )
         if room < self.cfg.min_room_pips:
-            logger.debug("Rejected: room %.1f pips < min %.1f",
-                         room, self.cfg.min_room_pips)
+            logger.info("Pre-filter REJECT: room %.1f pips < min %.1f (entry=%.2f, %s)",
+                        room, self.cfg.min_room_pips, signal.entry_price, signal.direction.value)
             return False
 
         # 2. Mid-range check
@@ -560,10 +577,13 @@ class Strategy:
         # 4. HTF alignment bonus (soft filter) — channel method already
         # selects strong zones, so we only reject truly weak channels
         # with no HTF alignment AND very low strength score
-        if not signal.sr_level.htf_aligned and signal.sr_level.strength < 20:
-            logger.debug("Rejected: S/R channel too weak (strength=%.1f, no HTF)",
+        if not signal.sr_level.htf_aligned and signal.sr_level.strength < 10:
+            logger.info("Pre-filter REJECT: S/R channel too weak (strength=%.1f, no HTF)",
                          signal.sr_level.strength)
             return False
+
+        logger.info("Pre-filter PASSED: room=%.1f, risk=%.1f pips, sr_str=%.1f, htf=%s",
+                     room, signal.risk_pips, signal.sr_level.strength, signal.sr_level.htf_aligned)
 
         return True
 
@@ -573,35 +593,37 @@ class Strategy:
                     df: pd.DataFrame, market: MarketState) -> bool:
         """
         Detect potential fakeout signals:
-        - Weak body (small body ratio)
-        - Low volume relative to average
-        - No strong close beyond the S/R level
-        - Counter-trend without volume
+        - Very weak body (< 0.15 body ratio) = doji/indecision
+        - Low volume impulse (only when real volume data exists)
+        - Counter-trend without strong body AND low volume session
         """
         o, h, l, c = float(bar["Open"]), float(bar["High"]), \
                       float(bar["Low"]), float(bar["Close"])
 
         br = body_ratio(o, c, h, l)
 
-        # Weak body = potential fakeout
-        if br < 0.20:
-            logger.debug("Fakeout: very weak body ratio %.2f", br)
+        # Very weak body = doji/indecision candle (loosened from 0.20 to 0.15)
+        if br < 0.15:
+            logger.debug("Fakeout: doji/indecision body ratio %.2f", br)
             return True
 
-        # Low volume fakeout
+        # Low volume fakeout — only check when real volume data exists
+        # (TwelveData often returns 0 volume for gold, so skip in that case)
         if market.current_volume_level == VolumeLevel.LOW:
-            if signal.entry_type == EntryType.IMPULSE:
-                logger.debug("Fakeout: impulse with low volume")
-                return True
+            avg_vol = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
+            if avg_vol > 0:  # Only filter when we have real volume data
+                if signal.entry_type == EntryType.IMPULSE:
+                    logger.debug("Fakeout: impulse with confirmed low volume")
+                    return True
 
-        # Counter-trend without strong confirmation
+        # Counter-trend without strong body: need body_ratio >= 0.35 (loosened from 0.40)
         if signal.direction == TradeDirection.BUY and market.trend == TrendType.DOWNTREND:
-            if br < 0.40 and not is_high_volume_session(market.session):
-                logger.debug("Fakeout: counter-trend buy without conviction")
+            if br < 0.35 and not is_high_volume_session(market.session):
+                logger.debug("Fakeout: counter-trend buy without conviction (br=%.2f)", br)
                 return True
         if signal.direction == TradeDirection.SELL and market.trend == TrendType.UPTREND:
-            if br < 0.40 and not is_high_volume_session(market.session):
-                logger.debug("Fakeout: counter-trend sell without conviction")
+            if br < 0.35 and not is_high_volume_session(market.session):
+                logger.debug("Fakeout: counter-trend sell without conviction (br=%.2f)", br)
                 return True
 
         return False
