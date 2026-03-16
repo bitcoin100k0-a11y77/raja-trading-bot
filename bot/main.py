@@ -30,6 +30,7 @@ from trade_manager import TradeManager
 from paper_trader import PaperTrader
 from learning_agent import LearningAgent
 from telegram_notifier import TelegramNotifier
+from constants import TradeDirection
 from utils import get_session, is_tradeable_session, body_ratio, utc_now, price_to_pips
 
 
@@ -113,7 +114,7 @@ class TradingBot:
     Main bot orchestrator implementing Raja Banks Market Fluidity Strategy.
 
     Loop every 30s:
-    1. Fetch M15 bars from Yahoo Finance
+    1. Fetch M15 bars from TwelveData
     2. On new bar: run full analysis pipeline
     3. Manage active trades (SL stages, TP, exits)
     4. Generate new signals with learning agent filter
@@ -341,7 +342,17 @@ class TradingBot:
         if self._last_bar_time and latest_time <= self._last_bar_time:
             # Same bar — only update active trades with latest price
             price = float(df["Close"].iloc[-1])
-            self._manage_active_trades(price)
+            exit_events = self._manage_active_trades(price)
+            # Process any full closes that happened between bars (TP2, SL, giveback)
+            if exit_events:
+                self.paper.process_exits(exit_events)
+                for event in exit_events:
+                    if event["full_close"]:
+                        trade = self.db.get_trade(event["trade_id"])
+                        if trade:
+                            context = self.db.get_context(event["trade_id"])
+                            self.learner.on_trade_closed(trade, context)
+                            self.telegram.notify_trade_closed(trade)
             return
 
         self._last_bar_time = latest_time
@@ -456,14 +467,25 @@ class TradingBot:
                 # 7. Execute
                 trade_id = self.paper.execute_signal(sig)
                 if trade_id:
+                    lot_size = self.risk_mgr.calculate_position_size(
+                        self.paper.balance, sig.risk_pips
+                    )
+                    risk_dollars = sig.risk_pips * self.cfg.strategy.pip_value_per_lot * lot_size
                     self.telegram.notify_trade_opened({
                         "trade_id": trade_id,
                         "direction": sig.direction.value,
-                        "lot_size": self.risk_mgr.calculate_position_size(
-                            self.paper.balance, sig.risk_pips
-                        ),
+                        "entry_type": sig.entry_type.value,
+                        "lot_size": lot_size,
                         "entry_price": sig.entry_price,
+                        "sl_price": sig.sl_price,
+                        "tp1_price": sig.tp1_price,
+                        "tp2_price": sig.tp2_price,
+                        "risk_pips": sig.risk_pips,
+                        "risk_dollars": risk_dollars,
                         "risk_percent": self.risk_mgr.current_risk_percent,
+                        "balance": self.paper.balance,
+                        "sr_level": sig.sr_level.price,
+                        "sr_touches": sig.sr_level.touches,
                     })
 
         # Session end: close all
@@ -516,6 +538,31 @@ class TradingBot:
                     market.resistance_levels[0].price
                     if market.resistance_levels else None
                 )
+
+                # Calculate unrealized P&L on open trades
+                open_trade_details = []
+                unrealized_pnl_total = 0.0
+                for tid, trade in self.trade_mgr.active_trades.items():
+                    if trade.direction == TradeDirection.BUY:
+                        pnl_pips = price_to_pips(current_price - trade.entry_price)
+                    else:
+                        pnl_pips = price_to_pips(trade.entry_price - current_price)
+                    pnl_dollars = pnl_pips * self.cfg.strategy.pip_value_per_lot * trade.remaining_lots
+                    unrealized_pnl_total += pnl_dollars
+                    open_trade_details.append({
+                        "trade_id": tid,
+                        "direction": trade.direction.value,
+                        "entry_price": trade.entry_price,
+                        "current_pnl_pips": round(pnl_pips, 1),
+                        "current_pnl_dollars": round(pnl_dollars, 2),
+                        "sl_price": trade.sl_price,
+                        "sl_stage": trade.sl_stage.value,
+                        "tp1_hit": trade.tp1_hit,
+                        "remaining_lots": trade.remaining_lots,
+                    })
+                status["open_trade_details"] = open_trade_details
+                status["unrealized_pnl"] = round(unrealized_pnl_total, 2)
+
         except Exception as e:
             logger.warning("Could not fetch market context for status: %s", e)
 

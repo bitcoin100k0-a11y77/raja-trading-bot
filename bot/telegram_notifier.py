@@ -139,29 +139,65 @@ class TelegramNotifier:
         self.send_sync(text)
 
     def notify_trade_opened(self, trade_info: Dict):
-        """Trade executed."""
+        """Trade executed — immediate notification with full details."""
+        direction = trade_info.get("direction", "?")
+        emoji = "🟢" if direction == "BUY" else "🔴"
+        entry = trade_info.get("entry_price", 0)
+        sl = trade_info.get("sl_price", 0)
+        tp1 = trade_info.get("tp1_price", 0)
+        tp2 = trade_info.get("tp2_price", 0)
+        risk_pips = trade_info.get("risk_pips", 0)
+
         text = (
-            f"📊 <b>TRADE OPENED</b>\n"
+            f"{emoji} <b>TRADE OPENED — {direction}</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
             f"ID: <code>{trade_info.get('trade_id', '?')}</code>\n"
-            f"Direction: {trade_info.get('direction', '?')}\n"
+            f"Type: {trade_info.get('entry_type', 'C1/C0')}\n"
             f"Lots: {trade_info.get('lot_size', 0):.2f}\n"
-            f"Entry: ${trade_info.get('entry_price', 0):.2f}\n"
-            f"Risk: {trade_info.get('risk_percent', 0):.1f}%"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Entry: ${entry:.2f}\n"
+            f"SL: ${sl:.2f} ({risk_pips:.0f} pips)\n"
+            f"TP1: ${tp1:.2f}\n"
+            f"TP2: ${tp2:.2f}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Risk: {trade_info.get('risk_percent', 0):.1f}% (${trade_info.get('risk_dollars', 0):.2f})\n"
+            f"S/R Level: ${trade_info.get('sr_level', 0):.2f} ({trade_info.get('sr_touches', 0)} touches)\n"
+            f"Balance: ${trade_info.get('balance', 0):,.2f}"
         )
         self.send_sync(text)
 
     def notify_trade_closed(self, trade_info: Dict):
-        """Trade closed with P&L."""
+        """Trade closed with full P&L summary."""
         pnl = trade_info.get("pnl_dollars", 0)
         emoji = "✅" if pnl >= 0 else "❌"
         rr = trade_info.get("rr_achieved", 0)
+        exit_reason = trade_info.get("exit_reason", "?")
+
+        # Determine exit reason label
+        reason_labels = {
+            "SL_STAGE1": "SL Hit (Stage 1)",
+            "SL_STAGE2": "SL Hit (C0 Level)",
+            "SL_STAGE3": "SL Hit (Breakeven)",
+            "TP1_HIT": "TP1 Hit (Partial)",
+            "TP2_HIT": "TP2 Hit (Full Target)",
+            "GIVEBACK_EXIT": "Give-back Exit",
+            "EMERGENCY_EXIT": "Emergency Exit",
+            "SESSION_END": "Session End Close",
+        }
+        reason_text = reason_labels.get(exit_reason, exit_reason)
 
         text = (
             f"{emoji} <b>TRADE CLOSED</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
             f"ID: <code>{trade_info.get('trade_id', '?')}</code>\n"
-            f"Reason: {trade_info.get('exit_reason', '?')}\n"
-            f"PnL: {trade_info.get('pnl_pips', 0):.0f}p (${pnl:+.2f})\n"
-            f"RR: {rr:.2f}\n"
+            f"Direction: {trade_info.get('direction', '?')}\n"
+            f"Entry: ${trade_info.get('entry_price', 0):.2f}\n"
+            f"Exit: ${trade_info.get('exit_price', 0):.2f}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Reason: {reason_text}\n"
+            f"PnL: {trade_info.get('pnl_pips', 0):.0f} pips (${pnl:+,.2f})\n"
+            f"R:R Achieved: {rr:.2f}\n"
+            "━━━━━━━━━━━━━━━━━\n"
             f"Balance: ${trade_info.get('balance_after', 0):,.2f}"
         )
         self.send_sync(text)
@@ -178,15 +214,17 @@ class TelegramNotifier:
         self.send_sync(text)
 
     def notify_trade_update(self, info: Dict):
-        """Partial close or other trade update (e.g., TP1 hit)."""
+        """Partial close — TP1 hit, 50% closed, remaining running to TP2."""
         text = (
-            f"🎯 <b>TRADE UPDATE</b>\n"
+            f"🎯 <b>TP1 HIT — 50% CLOSED</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
             f"ID: <code>{info.get('trade_id', '?')}</code>\n"
-            f"Event: {info.get('event', '?')}\n"
-            f"Price: ${info.get('exit_price', 0):.2f}\n"
-            f"PnL: {info.get('pnl_pips', 0):.0f} pips\n"
+            f"TP1 Price: ${info.get('exit_price', 0):.2f}\n"
+            f"PnL (closed): +{info.get('pnl_pips', 0):.0f} pips\n"
             f"Lots closed: {info.get('lots_closed', 0):.2f}\n"
-            "⏳ Remaining position running..."
+            "━━━━━━━━━━━━━━━━━\n"
+            "⏳ Remaining 50% running to TP2...\n"
+            "SL advancing to protect profits"
         )
         self.send_sync(text)
 
@@ -215,12 +253,12 @@ class TelegramNotifier:
             self.send_sync(text)
             return
 
-        # Normal periodic status (hourly)
+        # Normal periodic status
         now = datetime.now(timezone.utc)
         risk = status.get("risk_status", {})
 
         text = (
-            "📈 <b>HOURLY STATUS UPDATE</b>\n"
+            "📈 <b>STATUS UPDATE</b>\n"
             f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
             "━━━━━━━━━━━━━━━━━\n"
         )
@@ -251,17 +289,46 @@ class TelegramNotifier:
             if res:
                 text += f"🔴 Nearest Resistance: ${res:,.2f} ({rc} zones)\n"
 
+        # Performance
+        unrealized = status.get("unrealized_pnl", 0)
+        realized = status.get("total_pnl", 0)
+        total_equity = status.get("balance", 0) + unrealized
+
         text += (
             "━━━━━━━━━━━━━━━━━\n"
             f"💵 Balance: ${status.get('balance', 0):,.2f}\n"
-            f"📉 PnL: ${status.get('total_pnl', 0):+,.2f} "
+            f"📊 Realized PnL: ${realized:+,.2f} "
             f"({status.get('total_pnl_pct', 0):+.1f}%)\n"
+        )
+
+        if unrealized != 0:
+            text += f"📈 Unrealized PnL: ${unrealized:+,.2f}\n"
+            text += f"💰 Total Equity: ${total_equity:,.2f}\n"
+
+        text += (
             f"🎯 Win Rate: {status.get('win_rate', 0):.1f}%\n"
             f"📋 Today: {status.get('trades_today', 0)} trades "
             f"(${status.get('daily_pnl', 0):+.2f})\n"
-            f"📂 Open: {status.get('open_trades', 0)}\n"
             f"⚠️ Risk: {risk.get('current_risk_pct', 1.0):.2f}%"
         )
+
+        # Open trade details with live P&L
+        open_details = status.get("open_trade_details", [])
+        if open_details:
+            text += "\n━━━━━━━━━━━━━━━━━\n"
+            text += f"<b>OPEN TRADES ({len(open_details)}):</b>\n"
+            for t in open_details:
+                emoji = "🟢" if t["direction"] == "BUY" else "🔴"
+                pnl_emoji = "✅" if t["current_pnl_dollars"] >= 0 else "❌"
+                tp1_tag = " [TP1 ✓]" if t["tp1_hit"] else ""
+                stage_names = {1: "S1", 2: "S2-C0", 3: "BE"}
+                sl_tag = stage_names.get(t["sl_stage"], "S1")
+                text += (
+                    f"\n{emoji} {t['trade_id'][:8]}..{tp1_tag}\n"
+                    f"  Entry: ${t['entry_price']:.2f} | SL: ${t['sl_price']:.2f} ({sl_tag})\n"
+                    f"  {pnl_emoji} PnL: {t['current_pnl_pips']:+.1f}p (${t['current_pnl_dollars']:+.2f})\n"
+                )
+
         self.send_sync(text)
 
     def notify_learning_report(self, report: Dict):

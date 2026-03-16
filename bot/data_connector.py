@@ -1,13 +1,9 @@
 """
-Raja Banks Trading Agent - Multi-Source Data Connector
-Fetches XAU/USD M15 bars with automatic failover between data sources.
+Raja Banks Trading Agent - TwelveData Data Connector
+Fetches XAU/USD M15 bars from TwelveData API.
 
-Priority order:
-1. Twelve Data (primary) — Free tier: 800 calls/day, 8 calls/min
-2. Yahoo Finance (fallback) — Free, no API key needed
-3. Alpha Vantage (backup) — Free tier: 25 calls/day
-
-If one source fails, the bot seamlessly switches to the next.
+Simple 2-minute cache to keep API usage reasonable (~720 calls/day).
+TwelveData free tier: 800 calls/day, 8 calls/min.
 """
 import os
 import time
@@ -25,12 +21,13 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 
+
 # ============================================================
-# DATA SOURCE IMPLEMENTATIONS
+# TWELVEDATA SOURCE
 # ============================================================
 
 class TwelveDataSource:
-    """Twelve Data API — primary source for XAU/USD."""
+    """Twelve Data API — sole data source for XAU/USD."""
 
     BASE_URL = "https://api.twelvedata.com"
     INTERVAL_MAP = {
@@ -152,229 +149,13 @@ class TwelveDataSource:
         return None
 
 
-class YahooFinanceSource:
-    """Yahoo Finance via yfinance — free, no API key needed."""
-
-    INTERVAL_MAP = {
-        "15m": "15m",
-        "1h": "1h",
-        "4h": "4h",  # yfinance doesn't support 4h natively
-        "1d": "1d",
-    }
-
-    def __init__(self):
-        self.symbol = "GC=F"  # Gold Futures
-        self.name = "YahooFinance"
-        self._yf = None
-        self._yf_available = None
-
-    @property
-    def is_available(self) -> bool:
-        if self._yf_available is None:
-            try:
-                import yfinance
-                self._yf = yfinance
-                self._yf_available = True
-            except ImportError:
-                self._yf_available = False
-                logger.warning("[Yahoo] yfinance not installed — source unavailable")
-        return self._yf_available
-
-    def fetch_bars(self, interval: str, outputsize: int = 500) -> pd.DataFrame:
-        """Fetch OHLCV bars from Yahoo Finance."""
-        if not self.is_available:
-            raise ValueError("yfinance not installed")
-
-        yf_interval = self.INTERVAL_MAP.get(interval, "15m")
-
-        # Yahoo limits: 15m data only goes back ~60 days, 1m/5m only 30 days
-        if interval == "15m":
-            lookback_days = min(outputsize // 88 + 2, 59)  # ~88 bars/day for M15
-        elif interval == "1h":
-            lookback_days = min(outputsize // 22 + 2, 730)
-        else:
-            lookback_days = min(outputsize // 1 + 2, 365)
-
-        ticker = self._yf.Ticker(self.symbol)
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=lookback_days)
-
-        df = ticker.history(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval=yf_interval,
-        )
-
-        if df.empty:
-            return pd.DataFrame()
-
-        # yfinance returns columns: Open, High, Low, Close, Volume
-        # Index is already datetime
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-
-        # Keep only OHLCV columns
-        keep_cols = ["Open", "High", "Low", "Close", "Volume"]
-        for col in keep_cols:
-            if col not in df.columns:
-                df[col] = 0.0
-
-        df = df[keep_cols].copy()
-        df.sort_index(inplace=True)
-
-        # Limit to requested size
-        if len(df) > outputsize:
-            df = df.tail(outputsize)
-
-        return df
-
-    def get_current_price(self) -> Optional[float]:
-        if not self.is_available:
-            return None
-        try:
-            ticker = self._yf.Ticker(self.symbol)
-            data = ticker.history(period="1d", interval="1m")
-            if not data.empty:
-                return float(data["Close"].iloc[-1])
-        except Exception as e:
-            logger.warning("[Yahoo] Price fetch failed: %s", e)
-        return None
-
-
-class AlphaVantageSource:
-    """Alpha Vantage API — backup source (25 free calls/day)."""
-
-    BASE_URL = "https://www.alphavantage.co/query"
-    INTERVAL_MAP = {
-        "15m": "15min",
-        "1h": "60min",
-        "1d": "daily",
-    }
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.symbol = "XAUUSD"
-        self.name = "AlphaVantage"
-        self._session = requests.Session()
-        self._api_calls_today = 0
-        self._api_day = datetime.now(timezone.utc).date()
-
-    @property
-    def is_available(self) -> bool:
-        return bool(self.api_key)
-
-    def fetch_bars(self, interval: str, outputsize: int = 500) -> pd.DataFrame:
-        """Fetch OHLCV bars from Alpha Vantage."""
-        if not self.api_key:
-            raise ValueError("ALPHAVANTAGE_API_KEY not set")
-
-        # Track daily usage (25/day free tier)
-        today = datetime.now(timezone.utc).date()
-        if today != self._api_day:
-            self._api_calls_today = 0
-            self._api_day = today
-        self._api_calls_today += 1
-
-        if self._api_calls_today > 23:
-            logger.warning("[AlphaVantage] Approaching daily limit: %d/25",
-                           self._api_calls_today)
-
-        av_interval = self.INTERVAL_MAP.get(interval, "15min")
-
-        if interval == "1d":
-            function = "FX_DAILY"
-            params = {
-                "function": function,
-                "from_symbol": "XAU",
-                "to_symbol": "USD",
-                "outputsize": "full" if outputsize > 100 else "compact",
-                "apikey": self.api_key,
-            }
-            time_key = "Time Series FX (Daily)"
-        else:
-            function = "FX_INTRADAY"
-            params = {
-                "function": function,
-                "from_symbol": "XAU",
-                "to_symbol": "USD",
-                "interval": av_interval,
-                "outputsize": "full" if outputsize > 100 else "compact",
-                "apikey": self.api_key,
-            }
-            time_key = f"Time Series FX (Intraday)"
-
-        resp = self._session.get(self.BASE_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Alpha Vantage error handling
-        if "Error Message" in data:
-            raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
-        if "Note" in data:
-            raise ValueError(f"Alpha Vantage rate limit: {data['Note']}")
-
-        # Find the time series key (varies by endpoint)
-        ts_data = None
-        for key in data:
-            if "Time Series" in key:
-                ts_data = data[key]
-                break
-
-        if not ts_data:
-            return pd.DataFrame()
-
-        # Convert to DataFrame
-        rows = []
-        for dt_str, values in ts_data.items():
-            rows.append({
-                "datetime": dt_str,
-                "Open": float(values.get("1. open", 0)),
-                "High": float(values.get("2. high", 0)),
-                "Low": float(values.get("3. low", 0)),
-                "Close": float(values.get("4. close", 0)),
-                "Volume": 0.0,  # Forex doesn't have volume on AV
-            })
-
-        df = pd.DataFrame(rows)
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-        df.set_index("datetime", inplace=True)
-        df.sort_index(inplace=True)
-
-        if len(df) > outputsize:
-            df = df.tail(outputsize)
-
-        return df
-
-    def get_current_price(self) -> Optional[float]:
-        if not self.api_key:
-            return None
-        try:
-            resp = self._session.get(self.BASE_URL, params={
-                "function": "CURRENCY_EXCHANGE_RATE",
-                "from_currency": "XAU",
-                "to_currency": "USD",
-                "apikey": self.api_key,
-            }, timeout=10)
-            data = resp.json()
-            rate_data = data.get("Realtime Currency Exchange Rate", {})
-            price_str = rate_data.get("5. Exchange Rate")
-            if price_str:
-                return float(price_str)
-        except Exception as e:
-            logger.warning("[AlphaVantage] Price fetch failed: %s", e)
-        return None
-
-
 # ============================================================
-# MULTI-SOURCE DATA CONNECTOR (main interface)
+# DATA CONNECTOR (main interface)
 # ============================================================
 
 class DataConnector:
     """
-    Multi-source data connector with automatic failover.
-    Tries sources in priority order: TwelveData → Yahoo → AlphaVantage.
+    TwelveData-only data connector.
 
     Simple 2-minute cache: Fetches fresh data every 2 minutes for
     up-to-date prices while keeping API usage reasonable (~720 calls/day).
@@ -401,65 +182,23 @@ class DataConnector:
         self._htf_cache_minutes = 15
         self._consecutive_failures = 0
 
-        # Initialize data sources
+        # Initialize TwelveData source
         td_key = os.getenv("TWELVEDATA_API_KEY", "")
-        av_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
-
         self._twelve_data = TwelveDataSource(td_key)
-        self._yahoo = YahooFinanceSource()
-        self._alpha_vantage = AlphaVantageSource(av_key)
+        self._active_source_name = "TwelveData" if td_key else "none"
 
-        # Build source priority list (only available sources)
-        self._sources: List = []
-        self._active_source_name = "none"
-        self._rebuild_source_list()
-
-        # Log available sources
-        available = [s.name for s in self._sources]
-        logger.info("Data sources available: %s", ", ".join(available) if available else "NONE!")
-        if not available:
+        # Log status
+        if td_key:
+            logger.info("Data source: TwelveData (API key set)")
+        else:
             logger.critical(
-                "NO DATA SOURCES AVAILABLE! Set TWELVEDATA_API_KEY or "
-                "install yfinance (pip install yfinance) or set ALPHAVANTAGE_API_KEY"
+                "TWELVEDATA_API_KEY is NOT SET! The bot CANNOT fetch data. "
+                "Set it in Railway env vars. Get a free key at https://twelvedata.com"
             )
 
-    def _rebuild_source_list(self):
-        """Rebuild ordered list of available sources."""
-        self._sources = []
-        if self._twelve_data.is_available:
-            self._sources.append(self._twelve_data)
-        if self._yahoo.is_available:
-            self._sources.append(self._yahoo)
-        if self._alpha_vantage.is_available:
-            self._sources.append(self._alpha_vantage)
-
-    def _fetch_with_failover(self, interval: str, outputsize: int) -> Tuple[pd.DataFrame, str]:
-        """
-        Try each data source in priority order.
-        Returns (DataFrame, source_name) on success.
-        Raises last exception if all fail.
-        """
-        last_error = None
-
-        for source in self._sources:
-            try:
-                df = source.fetch_bars(interval, outputsize)
-                if not df.empty:
-                    if self._active_source_name != source.name:
-                        logger.info("Data source: switched to %s", source.name)
-                        self._active_source_name = source.name
-                    return df, source.name
-                else:
-                    logger.warning("[%s] Returned empty data, trying next source",
-                                   source.name)
-            except Exception as e:
-                last_error = e
-                logger.warning("[%s] Failed: %s — trying next source",
-                               source.name, e)
-
-        if last_error:
-            raise last_error
-        raise ValueError("No data sources available")
+    def _fetch_data(self, interval: str, outputsize: int) -> pd.DataFrame:
+        """Fetch data from TwelveData."""
+        return self._twelve_data.fetch_bars(interval, outputsize)
 
     def _should_fetch_fresh(self) -> bool:
         """
@@ -480,7 +219,7 @@ class DataConnector:
                    min_bars: int = 0,
                    use_cache: bool = True) -> pd.DataFrame:
         """
-        Fetch M15 bars with failover and 2-minute caching.
+        Fetch M15 bars with 2-minute caching.
 
         Fetches fresh data every 2 minutes for up-to-date prices.
         Between fetches, returns cached data for trade management.
@@ -493,7 +232,7 @@ class DataConnector:
                              age, 120 - age)
                 return self._cache.copy()
 
-        logger.info("Fetching fresh data from API (2-min interval)")
+        logger.info("Fetching fresh data from TwelveData (2-min interval)")
 
         # Calculate bars needed (~88 M15 bars per trading day)
         bars_needed = max(min_bars, int(lookback_days * 88))
@@ -501,12 +240,10 @@ class DataConnector:
 
         for attempt in range(MAX_RETRIES):
             try:
-                df, source = self._fetch_with_failover(
-                    self.timeframe, bars_needed
-                )
+                df = self._fetch_data(self.timeframe, bars_needed)
 
                 if df.empty:
-                    logger.warning("All sources returned empty (attempt %d/%d)",
+                    logger.warning("TwelveData returned empty (attempt %d/%d)",
                                    attempt + 1, MAX_RETRIES)
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY)
@@ -530,8 +267,8 @@ class DataConnector:
                 self._cache_time = datetime.now(timezone.utc)
                 self._consecutive_failures = 0
 
-                logger.info("Fetched %d %s bars from %s",
-                            len(df), self.timeframe, source)
+                logger.info("Fetched %d %s bars from TwelveData",
+                            len(df), self.timeframe)
                 return df
 
             except Exception as e:
@@ -558,14 +295,10 @@ class DataConnector:
         return df.iloc[-1]
 
     def get_current_price(self) -> Optional[float]:
-        """Get latest price — tries each source in order."""
-        for source in self._sources:
-            try:
-                price = source.get_current_price()
-                if price and price > 0:
-                    return price
-            except Exception:
-                continue
+        """Get latest price from TwelveData."""
+        price = self._twelve_data.get_current_price()
+        if price and price > 0:
+            return price
 
         # Fallback to cached close
         if self._cache is not None and not self._cache.empty:
@@ -611,7 +344,7 @@ class DataConnector:
 
     def fetch_htf_bars(self, timeframe: str = "1h",
                        lookback_days: int = 30) -> pd.DataFrame:
-        """Fetch higher timeframe bars with failover and caching."""
+        """Fetch higher timeframe bars with caching."""
         # Check HTF cache
         if self._htf_cache is not None and self._htf_cache_time:
             age = (datetime.now(timezone.utc) - self._htf_cache_time).total_seconds()
@@ -622,7 +355,7 @@ class DataConnector:
 
         for attempt in range(MAX_RETRIES):
             try:
-                df, source = self._fetch_with_failover(timeframe, bars_needed)
+                df = self._fetch_data(timeframe, bars_needed)
 
                 if df.empty:
                     if attempt < MAX_RETRIES - 1:
@@ -648,14 +381,14 @@ class DataConnector:
 
     def preload_bars(self, min_bars: int = 400) -> pd.DataFrame:
         """Preload historical bars for S/R zone detection."""
-        logger.info("Preloading %d+ M15 bars...", min_bars)
+        logger.info("Preloading %d+ M15 bars from TwelveData...", min_bars)
 
         request_size = min(min_bars + 100, 5000)
 
         try:
-            df, source = self._fetch_with_failover(self.timeframe, request_size)
+            df = self._fetch_data(self.timeframe, request_size)
         except Exception as e:
-            logger.error("Preload failed from all sources: %s", e)
+            logger.error("Preload failed: %s", e)
             return pd.DataFrame()
 
         if df.empty:
@@ -677,10 +410,10 @@ class DataConnector:
         self._consecutive_failures = 0
 
         if len(df) >= min_bars:
-            logger.info("Preloaded %d bars from %s — ready", len(df), source)
+            logger.info("Preloaded %d bars from TwelveData — ready", len(df))
         else:
-            logger.warning("Only preloaded %d bars from %s (target: %d)",
-                           len(df), source, min_bars)
+            logger.warning("Only preloaded %d bars from TwelveData (target: %d)",
+                           len(df), min_bars)
         return df
 
     @property
@@ -693,4 +426,6 @@ class DataConnector:
 
     @property
     def available_sources(self) -> List[str]:
-        return [s.name for s in self._sources]
+        if self._twelve_data.is_available:
+            return ["TwelveData"]
+        return []

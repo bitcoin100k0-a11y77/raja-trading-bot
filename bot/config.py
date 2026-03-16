@@ -128,7 +128,7 @@ class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
     chat_id: str = ""
-    status_interval_minutes: int = 60
+    status_interval_minutes: int = 120
 
 
 @dataclass
@@ -203,7 +203,7 @@ class BotConfig:
         cfg.telegram.enabled = _env_bool("TELEGRAM_ENABLED", False)
         cfg.telegram.bot_token = _env("TELEGRAM_BOT_TOKEN", "")
         cfg.telegram.chat_id = _env("TELEGRAM_CHAT_ID", "")
-        cfg.telegram.status_interval_minutes = _env_int("STATUS_INTERVAL_MIN", 60)
+        cfg.telegram.status_interval_minutes = _env_int("STATUS_INTERVAL_MIN", 120)
 
         # Learning
         cfg.learning.db_path = os.path.join(cfg.data_dir, "trading_bot.db")
