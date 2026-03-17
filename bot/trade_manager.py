@@ -63,13 +63,25 @@ class TradeManager:
         """
         Update all active trades with current price.
         Returns list of exit events: {trade_id, reason, exit_price, ...}
+
+        CRITICAL: Only removes trade from active_trades on full_close.
+        TP1 (partial close) keeps the trade alive so remaining 50% can
+        run to TP2 or get stopped out.
         """
         exits = []
         for trade_id, trade in list(self.active_trades.items()):
-            exit_event = self._update_single_trade(trade, current_price)
-            if exit_event:
-                exits.append(exit_event)
-                del self.active_trades[trade_id]
+            exit_events = self._update_single_trade(trade, current_price)
+            if exit_events:
+                # _update_single_trade can return a single event or a list
+                if isinstance(exit_events, dict):
+                    exit_events = [exit_events]
+                for event in exit_events:
+                    exits.append(event)
+                    if event["full_close"]:
+                        # Only remove trade on full close (TP2, SL, giveback, etc.)
+                        if trade_id in self.active_trades:
+                            del self.active_trades[trade_id]
+                        break  # Trade is gone, stop processing events for it
         return exits
 
     def update_trades_ohlc(self, open_p: float, high: float,
@@ -144,8 +156,12 @@ class TradeManager:
         return exits
 
     def _update_single_trade(self, trade: ActiveTrade,
-                             price: float) -> Optional[Dict]:
-        """Process a single trade against current price."""
+                             price: float):
+        """
+        Process a single trade against current price.
+        Returns: None, a single exit event dict, or a list of exit events
+        (e.g. [TP1_event, TP2_event] if both hit on the same tick).
+        """
 
         # Calculate current favorable distance
         if trade.direction == TradeDirection.BUY:
@@ -167,7 +183,17 @@ class TradeManager:
         # === CHECK TP1 ===
         tp1_event = self._check_tp1(trade, price)
         if tp1_event:
-            return tp1_event  # Partial close, trade continues
+            # TP1 hit — partial close. Trade continues with remaining 50%.
+            # Advance SL stages to protect remaining position
+            self._update_sl_stage(trade, favorable_pips)
+
+            # Check if TP2 is also hit on the same tick (price jumped past both)
+            tp2_event = self._check_tp2(trade, price)
+            if tp2_event:
+                logger.info("TP1 + TP2 hit on same tick for %s", trade.trade_id)
+                return [tp1_event, tp2_event]
+
+            return tp1_event  # Partial close only, trade stays active
 
         # === CHECK TP2 ===
         tp2_event = self._check_tp2(trade, price)
