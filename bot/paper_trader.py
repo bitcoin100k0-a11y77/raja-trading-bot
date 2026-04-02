@@ -34,11 +34,42 @@ class PaperTrader:
         self._load_balance()
 
     def _load_balance(self):
-        """Try to restore balance from last closed trade."""
-        recent = self.db.get_recent_trades(1)
-        if recent and recent[0].get("balance_after"):
-            self.balance = recent[0]["balance_after"]
-            logger.info("Restored balance: $%.2f", self.balance)
+        """
+        🔁 RECONCILE — Restore balance from database on startup.
+        Three-layer fallback:
+          1. Last CLOSED trade's balance_after (most accurate)
+          2. initial_balance + SUM of all closed trade P&L (recalculated)
+          3. Fall back to initial_balance only if DB has zero closed trades
+        """
+        try:
+            # Layer 1: Last closed trade with balance_after
+            closed = self.db.conn.execute(
+                "SELECT balance_after FROM trades "
+                "WHERE is_open = 0 AND balance_after IS NOT NULL "
+                "ORDER BY exit_time DESC LIMIT 1"
+            ).fetchone()
+            if closed and closed[0]:
+                self.balance = closed[0]
+                logger.info("🔁 Balance restored from last closed trade: $%.2f", self.balance)
+                return
+
+            # Layer 2: Recalculate from all closed trade P&L
+            total_pnl = self.db.conn.execute(
+                "SELECT COALESCE(SUM(pnl_dollars), 0) FROM trades WHERE is_open = 0"
+            ).fetchone()[0]
+            if total_pnl != 0:
+                self.balance = self.cfg.initial_balance + total_pnl
+                logger.info("🔁 Balance recalculated from P&L sum: $%.2f (initial $%.2f + P&L $%.2f)",
+                           self.balance, self.cfg.initial_balance, total_pnl)
+                return
+
+            # Layer 3: No closed trades — keep initial balance
+            logger.info("🔁 No closed trades found — starting with initial balance: $%.2f",
+                       self.balance)
+
+        except Exception as e:
+            logger.error("⚠️ Balance restore FAILED: %s — keeping initial balance $%.2f",
+                        str(e), self.balance)
 
     def execute_signal(self, signal: Signal) -> Optional[str]:
         """
