@@ -67,7 +67,7 @@ class StrategyConfig:
     min_room_pips: float = 15.0     # $1.5 room to opposing S/R (was $3, too tight)
     min_sr_gap_pips: float = 20.0
     max_mid_range_pct: float = 0.50  # 50% dead zone (was 35%, too restrictive)
-    min_sl_pips: float = 5.0
+    min_sl_pips: float = 20.0         # 🔴 LIVE RISK — minimum 20 pip SL for conviction (was 5.0)
     max_risk_pips: float = 300.0
     max_spread_pips: float = 10.0
 
@@ -84,6 +84,7 @@ class StrategyConfig:
     tp1_rr: float = 1.0
     tp1_close_pct: float = 0.50
     tp2_max_rr: float = 2.5
+    min_tp1_pips: float = 30.0        # 🔴 LIVE RISK — TP1 floor: if SL < 30p, TP1 = 30p minimum
 
     # === SPECIAL EXITS ===
     giveback_trigger_pips: float = 30.0
@@ -166,7 +167,6 @@ class BotConfig:
         # Strategy
         cfg.strategy.symbol = _env("SYMBOL", "GC=F")
         cfg.strategy.timeframe = _env("TIMEFRAME", "15m")
-        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 5.0)
         cfg.strategy.max_risk_pips = _env_float("MAX_RISK_PIPS", 300.0)
         cfg.strategy.session_start = _env_int("SESSION_START", 6)
         cfg.strategy.session_end = _env_int("SESSION_END", 22)
@@ -179,6 +179,10 @@ class BotConfig:
         cfg.strategy.sr_loopback = _env_int("SR_LOOPBACK", 290)
         cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 11)
         cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 14)
+
+        # SL / TP params
+        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 20.0)
+        cfg.strategy.min_tp1_pips = _env_float("MIN_TP1_PIPS", 30.0)
 
         # Entry params
         cfg.strategy.rejection_tolerance = _env_float("REJECTION_TOLERANCE", 8.0)

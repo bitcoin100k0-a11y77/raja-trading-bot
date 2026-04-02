@@ -635,11 +635,15 @@ class Strategy:
                       ) -> tuple:
         """
         Calculate TP1 and TP2 prices.
-        TP1 = 1:1 R:R
+        TP1 = max(min_tp1_pips, SL size) — floor of 30 pips, or 1:1 if SL > 30p
         TP2 = nearest opposing S/R or max 2.5R
         """
         risk_dollars = pips_to_price(risk_pips)
-        tp1_dollars = risk_dollars * self.cfg.tp1_rr
+
+        # 🔴 LIVE RISK — TP1: minimum 30 pips, or 1:1 RR if SL >= 30 pips
+        min_tp1 = getattr(self.cfg, 'min_tp1_pips', 30.0)
+        tp1_pips = max(min_tp1, risk_pips * self.cfg.tp1_rr)
+        tp1_dollars = pips_to_price(tp1_pips)
 
         if direction == TradeDirection.BUY:
             tp1 = entry + tp1_dollars
