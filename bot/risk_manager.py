@@ -33,10 +33,26 @@ class RiskManager:
         self._current_risk_pct = risk_config.risk_percent
         self._last_loss_time: Optional[datetime] = None
         self._cooldown_active = False
+        # Start-of-day balance for daily loss % calculation.
+        # Using current balance as denominator grows the % as losses accumulate,
+        # causing the circuit breaker to trip earlier than the configured limit.
+        self._daily_start_balance: Optional[float] = None
+        self._daily_start_date: Optional[str] = None
 
     @property
     def current_risk_percent(self) -> float:
         return self._current_risk_pct
+
+    def record_daily_start(self, balance: float) -> None:
+        """
+        Record today's starting balance (call once per tick before can_trade).
+        Used as the denominator for daily loss % so the limit is stable all day.
+        """
+        today = utc_now().strftime("%Y-%m-%d")
+        if self._daily_start_date != today:
+            self._daily_start_date = today
+            self._daily_start_balance = balance
+            logger.info("Daily start balance recorded: $%.2f", balance)
 
     def can_trade(self, balance: float) -> tuple:
         """
@@ -48,9 +64,13 @@ class RiskManager:
         if trades_today >= self.cfg.max_trades_per_day:
             return False, f"Daily trade limit reached ({trades_today}/{self.cfg.max_trades_per_day})"
 
-        # Daily loss limit
+        # Daily loss limit — use start-of-day balance as denominator so the
+        # circuit-breaker threshold is stable across the session. Using current
+        # balance (which shrinks with each loss) would make the % grow faster
+        # than intended and trip the limit before the configured threshold.
         daily_pnl = self.db.get_daily_pnl()
-        daily_loss_pct = abs(daily_pnl) / balance * 100 if balance > 0 else 0
+        base_balance = self._daily_start_balance or balance
+        daily_loss_pct = abs(daily_pnl) / base_balance * 100 if base_balance > 0 else 0
         if daily_pnl < 0 and daily_loss_pct >= self.cfg.daily_loss_limit:
             return False, f"Daily loss limit reached ({daily_loss_pct:.1f}% >= {self.cfg.daily_loss_limit}%)"
 

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from config import StrategyConfig
 from constants import TrendType, SessionType, VolumeLevel, ZoneType
@@ -70,7 +71,9 @@ class MarketAnalyzer:
             return self._empty_state(current_price or 0.0)
 
         price = current_price or float(df["Close"].iloc[-1])
-        utc_hour = df.index[-1].hour if hasattr(df.index[-1], 'hour') else 12
+        # Use wall-clock UTC, not bar timestamp hour.
+        # ICMarkets EET timestamps are UTC+3 — bar .hour is 3 hours ahead.
+        utc_hour = datetime.now(timezone.utc).hour
 
         # Trend analysis
         highs = df["High"].values
@@ -148,11 +151,14 @@ class MarketAnalyzer:
                           htf_df: Optional[pd.DataFrame] = None
                           ) -> Tuple[List[SRLevel], List[SRLevel]]:
         """
-        S/R Channel Detection (LonesomeTheBlue method).
-        Replaces old swing-clustering with institutional-style channel zones:
-        1. Detect pivot highs/lows with configurable lookback
-        2. Group nearby pivots into channels within max width % of price range
-        3. Score each channel by bar touches (strength)
+        S/R Channel Detection (LonesomeTheBlue method) — BODY-BASED.
+        Uses body extremes (max/min of Open,Close) for pivot detection so zones
+        anchor at where price CLOSED (body), not where wicks extended to.
+        Raja Banks method: zones drawn at body close level, not wick tip.
+
+        1. Detect pivot highs/lows using BODY extremes (not wicks)
+        2. Group nearby pivots into channels within max width % of body range
+        3. Score each channel by bar body-touches (strength)
         4. Greedy strongest-first selection up to max_channels
         5. Classify as support/resistance relative to current price
         + HTF zone stacking bonus
@@ -164,19 +170,25 @@ class MarketAnalyzer:
         recent = df.tail(scan)
         highs = recent["High"].values
         lows = recent["Low"].values
-        closes = recent["Close"].values
+        opens = recent["Open"].values    # needed for body-based pivots
+        closes = recent["Close"].values  # needed for body-based pivots
         n = len(highs)
 
-        # Step 1: Detect pivots
-        pivot_vals = self._detect_pivots(highs, lows, self.cfg.pivot_period)
+        # Body extremes: body_top = max(O,C),  body_bot = min(O,C)
+        body_tops = np.maximum(opens, closes)   # pivot HIGH using body close
+        body_bots = np.minimum(opens, closes)   # pivot LOW  using body close
+
+        # Step 1: Detect pivots using BODY extremes (not High/Low wicks)
+        pivot_vals = self._detect_pivots_body(body_tops, body_bots,
+                                              self.cfg.pivot_period)
 
         if len(pivot_vals) == 0:
             return [], []
 
-        # Calculate max channel width (% of 300-bar range)
+        # Calculate max channel width (% of 300-bar BODY range — tighter than wick)
         range_bars = min(300, n)
-        prdhighest = float(highs[-range_bars:].max())
-        prdlowest = float(lows[-range_bars:].min())
+        prdhighest = float(body_tops[-range_bars:].max())
+        prdlowest = float(body_bots[-range_bars:].min())
         cwidth = (prdhighest - prdlowest) * self.cfg.channel_width_pct / 100.0
 
         if cwidth <= 0:
@@ -188,16 +200,27 @@ class MarketAnalyzer:
             hi, lo, strength = self._build_sr_channel(x, pivot_vals, cwidth)
             supres.append([float(strength), float(hi), float(lo)])
 
-        # Step 3: Add bar-touch strength (vectorized for speed)
-        supres_arr = np.array(supres)  # shape: (num_pivots, 3) = [strength, hi, lo]
+        # Step 3: Add bar-touch strength using BODY touches (consistent with body zones)
+        # Also disqualify channels that don't have enough body interaction —
+        # a zone formed by isolated pivots with no surrounding price congestion
+        # is not a real S/R zone (just a random bar extreme).
+        min_body_touches = getattr(self.cfg, 'sr_min_body_touches', 3)
         for x in range(len(supres)):
+            if supres[x][0] < 0:
+                continue  # already disqualified
             h_val = supres[x][1]
             l_val = supres[x][2]
-            # Count bars whose high or low falls within [lo, hi] channel
-            high_in = (highs <= h_val) & (highs >= l_val)
-            low_in = (lows <= h_val) & (lows >= l_val)
-            s = int(np.sum(high_in | low_in))
-            supres[x][0] += s
+            # Count bars whose body top or body bottom falls within [lo, hi] channel
+            body_top_in = (body_tops <= h_val) & (body_tops >= l_val)
+            body_bot_in = (body_bots <= h_val) & (body_bots >= l_val)
+            s = int(np.sum(body_top_in | body_bot_in))
+            if s < min_body_touches:
+                # Not enough bar-body interaction — isolated pivot, not a real zone
+                supres[x][0] = -1
+                logger.debug("Zone %.2f-%.2f disqualified: only %d body touches (min=%d)",
+                             l_val, h_val, s, min_body_touches)
+            else:
+                supres[x][0] += s
 
         # Step 4: Greedy strongest-first selection
         sr_zones = []
@@ -288,12 +311,39 @@ class MarketAnalyzer:
         return support, resistance
 
     @staticmethod
+    def _detect_pivots_body(body_tops: np.ndarray, body_bots: np.ndarray,
+                            prd: int) -> List[float]:
+        """
+        Detect pivot high/low values using BODY extremes (Raja Banks method).
+        Body top  = max(Open, Close) — pivot HIGH when body_top[i] is highest
+                    in the [i-prd, i+prd] window.
+        Body bot  = min(Open, Close) — pivot LOW  when body_bot[i] is lowest
+                    in the [i-prd, i+prd] window.
+
+        This anchors zones at where candles CLOSED (body), not at wick tips.
+        Produces tighter, more tradeable zones vs wick-based detection.
+        """
+        n = len(body_tops)
+        pivots = []
+        for i in range(prd, n - prd):
+            # Pivot high: body top at i is the highest body top in the window
+            window_top = body_tops[i - prd:i + prd + 1]
+            if body_tops[i] >= window_top.max():
+                pivots.append(float(body_tops[i]))
+
+            # Pivot low: body bottom at i is the lowest body bottom in the window
+            window_bot = body_bots[i - prd:i + prd + 1]
+            if body_bots[i] <= window_bot.min():
+                pivots.append(float(body_bots[i]))
+
+        return pivots
+
+    @staticmethod
     def _detect_pivots(highs: np.ndarray, lows: np.ndarray,
                        prd: int) -> List[float]:
         """
-        Detect pivot high/low values (equivalent to ta.pivothigh/ta.pivotlow).
-        A pivot high at bar i requires high[i] to be highest of bars [i-prd, i+prd].
-        A pivot low at bar i requires low[i] to be lowest of bars [i-prd, i+prd].
+        Legacy wick-based pivot detection (kept for reference / HTF levels).
+        NOT used for main S/R zone detection — see _detect_pivots_body.
         """
         n = len(highs)
         pivots = []

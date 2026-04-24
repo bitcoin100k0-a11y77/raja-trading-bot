@@ -341,34 +341,50 @@ class TradeManager:
 
         elif trade.sl_stage == SLStage.STAGE_3 and \
              getattr(self.cfg, 'trailing_enabled', True) and \
-             favorable_pips >= getattr(self.cfg, 'trailing_activation_pips', 50.0):
-            # Trailing stop: lock in profits by trailing SL behind price
+             trade.max_favorable_pips >= getattr(self.cfg, 'trailing_activation_pips', 50.0):
+            # Trailing stop: trail SL behind the HIGH-WATER MARK (peak pips),
+            # NOT current pips. Without this, a pullback from +80 to +60 pips
+            # would incorrectly move the SL BACK from entry+60 to entry+40.
+            # Correct: SL always = entry + (peak_pips - trail_distance), ratcheting up.
             trail_dist = pips_to_price(getattr(self.cfg, 'trailing_distance_pips', 20.0))
             if trade.direction == TradeDirection.BUY:
-                # For BUY: trail SL below the current high-water mark
-                new_sl = trade.entry_price + pips_to_price(favorable_pips) - trail_dist
-                if new_sl > trade.sl_price:
+                # Trail SL below the high-water mark (max_favorable_pips, not current)
+                new_sl = trade.entry_price + pips_to_price(trade.max_favorable_pips) - trail_dist
+                if new_sl > trade.sl_price:  # Only ratchet UP — never back down
                     old_sl = trade.sl_price
                     trade.sl_price = round(new_sl, 2)
-                    logger.info("Trailing SL: %s moved SL %.2f -> %.2f (+%.1f pips locked)",
-                                trade.trade_id, old_sl, trade.sl_price,
-                                price_to_pips(trade.sl_price - trade.entry_price))
+                    logger.info(
+                        "Trailing SL: %s moved SL %.2f -> %.2f "
+                        "(peak=+%.1f pips locked, trail=%.1f pips)",
+                        trade.trade_id, old_sl, trade.sl_price,
+                        trade.max_favorable_pips,
+                        price_to_pips(trade.sl_price - trade.entry_price)
+                    )
             else:
-                # For SELL: trail SL above the current low-water mark
-                new_sl = trade.entry_price - pips_to_price(favorable_pips) + trail_dist
-                if new_sl < trade.sl_price:
+                # Trail SL above the low-water mark (max_favorable_pips, not current)
+                new_sl = trade.entry_price - pips_to_price(trade.max_favorable_pips) + trail_dist
+                if new_sl < trade.sl_price:  # Only ratchet DOWN — never back up
                     old_sl = trade.sl_price
                     trade.sl_price = round(new_sl, 2)
-                    logger.info("Trailing SL: %s moved SL %.2f -> %.2f (+%.1f pips locked)",
-                                trade.trade_id, old_sl, trade.sl_price,
-                                price_to_pips(trade.entry_price - trade.sl_price))
+                    logger.info(
+                        "Trailing SL: %s moved SL %.2f -> %.2f "
+                        "(peak=+%.1f pips locked, trail=%.1f pips)",
+                        trade.trade_id, old_sl, trade.sl_price,
+                        trade.max_favorable_pips,
+                        price_to_pips(trade.entry_price - trade.sl_price)
+                    )
 
     def _check_giveback(self, trade: ActiveTrade,
                         favorable_pips: float) -> Optional[Dict]:
         """
         Give-back exit: If price was +30 pips favorable and pulls back 50%,
-        close remaining position.
+        close remaining position. Only active AFTER TP1 partial close —
+        before TP1, the 3-stage SL system manages the full position.
         """
+        # Give-back only protects the remaining 50% after TP1 hit.
+        # Before TP1: trade is managed by SL stages + trailing only.
+        if not trade.tp1_hit:
+            return None
         if trade.max_favorable_pips < self.cfg.giveback_trigger_pips:
             return None
 
@@ -528,7 +544,7 @@ class TradeManager:
                     tp2_price=row.get("tp2_price") or 0.0,
                     tp1_hit=bool(row.get("tp1_hit", 0)),
                     partial_close_pct=row.get("partial_close_pct", 0.0),
-                    max_favorable_pips=0.0,  # Will be re-calculated on next tick
+                    max_favorable_pips=row.get("max_favorable_pips") or 0.0,
                     c0_extreme=None,  # Lost on restart — conservative SL fallback used
                 )
                 self.active_trades[trade.trade_id] = trade

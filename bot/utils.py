@@ -151,7 +151,7 @@ def is_high_volume_session(session: SessionType) -> bool:
     return session in (SessionType.LONDON, SessionType.NY_LONDON_OVERLAP)
 
 
-def is_tradeable_session(utc_hour: int, session_start: int = 6,
+def is_tradeable_session(utc_hour: int, session_start: int = 8,
                          session_end: int = 22) -> bool:
     return session_start <= utc_hour < session_end
 

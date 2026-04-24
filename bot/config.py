@@ -1,7 +1,8 @@
 """
-Raja Banks Trading Bot - Configuration
+MT5 Trading Bot - Configuration
 All parameters loaded from environment variables with sensible defaults.
 Optimized values from 4+ years of XAUUSD M15 backtesting (2021-2026).
+Live MT5 trading with hard safety switches.
 """
 import os
 from dataclasses import dataclass, field
@@ -34,7 +35,8 @@ class StrategyConfig:
     # === S/R CHANNEL DETECTION (LonesomeTheBlue method) ===
     pivot_period: int = 10          # Lookback/lookforward bars for pivot detection
     channel_width_pct: float = 5.0  # Max channel width as % of 300-bar range
-    sr_min_strength: int = 1        # Min pivot count per channel
+    sr_min_strength: int = 2        # Min pivot count per channel (2 = at least 2 pivots must cluster)
+    sr_min_body_touches: int = 2    # Min bar bodies overlapping zone (lowered 3→2: catch 2-touch reactions)
     sr_max_channels: int = 6        # Max S/R channels to detect
     sr_loopback: int = 290          # Bars to scan for pivots
 
@@ -50,7 +52,11 @@ class StrategyConfig:
     c1_body_min: float = 0.30
     c1_min_range_pips: float = 0.0
     rejection_tolerance: float = 8.0   # $8 tolerance — gold M15 candles range $5-15
-    pending_expiry_bars: int = 3
+    pending_expiry_bars: int = 2       # 🔴 MT5 pending-order expiry: 2 bars (30 min) after C1 close.
+                                       # Strategy no longer queues pending — MT5 holds the stop directly.
+                                       # Structural invalidation (main._check_stop_invalidation) cancels
+                                       # early if the C1 wick is breached intra-bar.
+    c1_stop_buffer_pips: float = 2.0   # Buffer above C1 high (BUY) / below C1 low (SELL) for stop trigger
 
     # === IMPULSE ENTRY ===
     impulse_enabled: bool = False
@@ -63,11 +69,28 @@ class StrategyConfig:
     break_confirmation_pips: float = 5.0
     retest_max_bars: int = 8
 
+    # === C0 CONFIRMATION CANDLE QUALITY ===
+    # C0 is now a VALIDATION GATE (not final entry bar). Actual entry is a STOP order
+    # placed at C1 extreme + c1_stop_buffer_pips. These knobs gate when the stop gets placed.
+    # Minimum wick depth for a valid C0 (avoids 1-pip noise wicks opening stop orders)
+    c0_min_wick_pips: float = 5.0          # ⚠️ ENV: C0_MIN_WICK_PIPS  (5 pips: C0 is gate, not entry — stop order at C1 filters false rejections)
+    # Maximum distance (pips) between C0 open and the S/R zone that generated C1.
+    # C0 must form near the zone, not far off in random price space.
+    c0_max_distance_from_zone_pips: float = 50.0  # ⚠️ ENV: C0_MAX_DISTANCE_FROM_ZONE_PIPS  (loosened 30→50)
+
+    # === ENTRY SLIPPAGE GATE ===
+    # 🔴 LIVE RISK — max pips from C0 close we still accept a market order.
+    # The bot detects C0 on the next 30-second tick after the bar closes.
+    # XAUUSD M15 can move 10-20 pips in 30 seconds. 20 pips handles normal
+    # post-C0-close movement without skipping valid setups.
+    max_entry_slippage_pips: float = 20.0  # ⚠️ ENV: MAX_ENTRY_SLIPPAGE_PIPS
+
     # === PRE-ENTRY FILTERS ===
     min_room_pips: float = 15.0     # $1.5 room to opposing S/R (was $3, too tight)
     min_sr_gap_pips: float = 20.0
     max_mid_range_pct: float = 0.50  # 50% dead zone (was 35%, too restrictive)
-    min_sl_pips: float = 20.0         # 🔴 LIVE RISK — minimum 20 pip SL for conviction (was 5.0)
+    min_sl_pips: float = 10.0         # 🔴 LIVE RISK — stop-order model uses C1 wick tip SL (tighter than old C0-market-entry SL).
+                                      # 20p floor inherited from C0-market-entry model; was blocking most valid C1 setups silently.
     max_risk_pips: float = 300.0
     max_spread_pips: float = 10.0
 
@@ -92,8 +115,10 @@ class StrategyConfig:
     small_body_threshold: float = 0.35
 
     # === SESSION FILTER (UTC hours) ===
-    session_start: int = 6
-    session_end: int = 22
+    # London open = 08:00 UTC, NY close = 22:00 UTC
+    # Do NOT change session_start below 8 — 06:00 UTC is still Asia session
+    session_start: int = 8   # ⚠️ ENV: SESSION_START — London open
+    session_end: int = 22    # ⚠️ ENV: SESSION_END   — NY close
     session_blackout_start: int = 11
     session_blackout_end: int = 14
 
@@ -133,15 +158,35 @@ class TelegramConfig:
 
 
 @dataclass
+class MT5Config:
+    """MT5 Connection Configuration — ⚠️ ENV REQUIRED for live trading"""
+    login: int = 0               # ⚠️ ENV: MT5_LOGIN
+    password: str = ""           # ⚠️ ENV: MT5_PASSWORD
+    server: str = ""             # ⚠️ ENV: MT5_SERVER
+    mt5_path: str = ""           # ⚠️ ENV: MT5_PATH (optional, auto-detect on Windows)
+    symbol: str = "XAUUSD"       # ⚠️ ENV: MT5_SYMBOL
+    magic_number: int = 20260402 # ⚠️ ENV: MT5_MAGIC
+    max_slippage: int = 20       # ⚠️ ENV: MT5_SLIPPAGE (points)
+    filling_mode: str = "IOC"    # ⚠️ ENV: MT5_FILLING
+    connect_timeout: int = 60000 # milliseconds
+
+
+@dataclass
 class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    mt5: MT5Config = field(default_factory=MT5Config)
 
     # === PAPER TRADING ===
     initial_balance: float = 10000.0
     dry_run: bool = True
+
+    # === LIVE MODE ===
+    # 📵 KILL SWITCH — hard env var, default OFF
+    # Must be explicitly set to "true" for live execution
+    live_mode: bool = False
 
     # === BOT SETTINGS ===
     update_interval_seconds: int = 30
@@ -152,7 +197,7 @@ class BotConfig:
     data_dir: str = "data"
 
     @classmethod
-    def from_env(cls):
+    def from_env(cls) -> "BotConfig":
         """Load all config from environment variables."""
         cfg = cls()
 
@@ -168,26 +213,32 @@ class BotConfig:
         cfg.strategy.symbol = _env("SYMBOL", "GC=F")
         cfg.strategy.timeframe = _env("TIMEFRAME", "15m")
         cfg.strategy.max_risk_pips = _env_float("MAX_RISK_PIPS", 300.0)
-        cfg.strategy.session_start = _env_int("SESSION_START", 6)
-        cfg.strategy.session_end = _env_int("SESSION_END", 22)
+        cfg.strategy.session_start = _env_int("SESSION_START", 8)   # 08:00 UTC = London open
+        cfg.strategy.session_end = _env_int("SESSION_END", 22)     # 22:00 UTC = NY close
 
         # S/R Channel Detection
         cfg.strategy.pivot_period = _env_int("PIVOT_PERIOD", 10)
         cfg.strategy.channel_width_pct = _env_float("CHANNEL_WIDTH_PCT", 5.0)
-        cfg.strategy.sr_min_strength = _env_int("SR_MIN_STRENGTH", 1)
         cfg.strategy.sr_max_channels = _env_int("SR_MAX_CHANNELS", 6)
         cfg.strategy.sr_loopback = _env_int("SR_LOOPBACK", 290)
         cfg.strategy.session_blackout_start = _env_int("BLACKOUT_START", 11)
         cfg.strategy.session_blackout_end = _env_int("BLACKOUT_END", 14)
 
         # SL / TP params
-        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 20.0)
+        cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 10.0)
         cfg.strategy.min_tp1_pips = _env_float("MIN_TP1_PIPS", 30.0)
 
         # Entry params
         cfg.strategy.rejection_tolerance = _env_float("REJECTION_TOLERANCE", 8.0)
         cfg.strategy.min_room_pips = _env_float("MIN_ROOM_PIPS", 15.0)
         cfg.strategy.max_mid_range_pct = _env_float("MAX_MID_RANGE_PCT", 0.50)
+        cfg.strategy.max_entry_slippage_pips = _env_float("MAX_ENTRY_SLIPPAGE_PIPS", 20.0)  # ⚠️ ENV REQUIRED for live
+        cfg.strategy.c0_min_wick_pips = _env_float("C0_MIN_WICK_PIPS", 5.0)
+        cfg.strategy.c0_max_distance_from_zone_pips = _env_float("C0_MAX_DISTANCE_FROM_ZONE_PIPS", 50.0)
+        cfg.strategy.sr_min_strength = _env_int("SR_MIN_STRENGTH", 2)
+        cfg.strategy.sr_min_body_touches = _env_int("SR_MIN_BODY_TOUCHES", 2)
+        cfg.strategy.pending_expiry_bars = _env_int("PENDING_EXPIRY_BARS", 2)
+        cfg.strategy.c1_stop_buffer_pips = _env_float("C1_STOP_BUFFER_PIPS", 2.0)
 
         # Entry types
         cfg.strategy.impulse_enabled = _env_bool("IMPULSE_ENABLED", False)
@@ -213,5 +264,18 @@ class BotConfig:
         cfg.learning.db_path = os.path.join(cfg.data_dir, "trading_bot.db")
         cfg.learning.analysis_interval = _env_int("LEARNING_INTERVAL", 10)
         cfg.learning.min_trades_for_blocking = _env_int("MIN_TRADES_BLOCK", 15)
+
+        # MT5 Connection  ⚠️ ENV REQUIRED for live trading
+        cfg.mt5.login = _env_int("MT5_LOGIN", 0)
+        cfg.mt5.password = _env("MT5_PASSWORD", "")
+        cfg.mt5.server = _env("MT5_SERVER", "")
+        cfg.mt5.mt5_path = _env("MT5_PATH", "")
+        cfg.mt5.symbol = _env("MT5_SYMBOL", "XAUUSD")
+        cfg.mt5.magic_number = _env_int("MT5_MAGIC", 20260402)
+        cfg.mt5.max_slippage = _env_int("MT5_SLIPPAGE", 20)
+        cfg.mt5.filling_mode = _env("MT5_FILLING", "IOC")
+
+        # 📵 KILL SWITCH — must be explicitly set to "true" for live execution
+        cfg.live_mode = _env_bool("LIVE_MODE", False)
 
         return cfg

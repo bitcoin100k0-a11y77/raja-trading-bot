@@ -166,6 +166,42 @@ class TelegramNotifier:
         )
         self.send_sync(text)
 
+    def notify_pending_stop(self, stop_info: Dict):
+        """🔴 Pending STOP order placed (C1 break-of-rejection entry — NEW MODEL).
+
+        Fires AFTER C0 validated the rejection setup (wick + distance +
+        direction gates) AND we placed a BUY_STOP / SELL_STOP at C1 extreme.
+        Order waits up to 1 bar (15 min) for price to break C1 wick. On fill
+        the broker converts pending → position, reconciler picks up on next
+        tick, trade_manager takes over (SL staging + TP1/TP2 + trailing).
+        """
+        direction = stop_info.get("direction", "?")
+        emoji = "📈" if direction == "BUY" else "📉"
+        ticket = stop_info.get("ticket", 0)
+        trigger = stop_info.get("trigger_price", 0)
+        sl = stop_info.get("sl_price", 0)
+        tp1 = stop_info.get("tp1_price", 0)
+        risk_pips = stop_info.get("risk_pips", 0)
+        buffer = stop_info.get("stop_buffer_pips", 0)
+        expiry_bars = stop_info.get("expiry_bars", 1)
+        sr_price = stop_info.get("sr_level", 0)
+
+        text = (
+            f"{emoji} <b>STOP PENDING — {direction}</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Ticket: <code>{ticket}</code>\n"
+            f"Type: {'BUY_STOP' if direction == 'BUY' else 'SELL_STOP'}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Trigger: ${trigger:.2f} (C1 extreme + {buffer:.0f}p buffer)\n"
+            f"SL: ${sl:.2f} ({risk_pips:.0f} pips — C1 opposite wick)\n"
+            f"TP1: ${tp1:.2f}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"S/R: ${sr_price:.2f}\n"
+            f"Expiry: {expiry_bars} bar ({expiry_bars * 15} min)\n"
+            f"Awaiting C1 wick breakout..."
+        )
+        self.send_sync(text)
+
     def notify_trade_closed(self, trade_info: Dict):
         """Trade closed with full P&L summary."""
         pnl = trade_info.get("pnl_dollars", 0)
@@ -173,18 +209,21 @@ class TelegramNotifier:
         rr = trade_info.get("rr_achieved", 0)
         exit_reason = trade_info.get("exit_reason", "?")
 
-        # Determine exit reason label
+        # Determine exit reason label.
+        # DB stores lowercase values (e.g. "sl_stage1") from ExitReason.value.
+        # Keys are uppercase — normalise with .upper() so lookup always matches.
         reason_labels = {
-            "SL_STAGE1": "SL Hit (Stage 1)",
-            "SL_STAGE2": "SL Hit (C0 Level)",
-            "SL_STAGE3": "SL Hit (Breakeven)",
-            "TP1_HIT": "TP1 Hit (Partial)",
+            "SL_STAGE1": "SL Hit (Stage 1 — Initial)",
+            "SL_STAGE2": "SL Hit (Stage 2 — C0 Level)",
+            "SL_STAGE3": "SL Hit (Stage 3 — Trailing/BE)",
+            "TP1_HIT": "TP1 Hit (50% Partial)",
             "TP2_HIT": "TP2 Hit (Full Target)",
             "GIVEBACK_EXIT": "Give-back Exit",
             "EMERGENCY_EXIT": "Emergency Exit",
             "SESSION_END": "Session End Close",
         }
-        reason_text = reason_labels.get(exit_reason, exit_reason)
+        reason_key = exit_reason.upper() if isinstance(exit_reason, str) else "?"
+        reason_text = reason_labels.get(reason_key, exit_reason)
 
         text = (
             f"{emoji} <b>TRADE CLOSED</b>\n"
@@ -384,8 +423,36 @@ class TelegramNotifier:
 
         self.send_sync(text)
 
+    def notify_broker_alert(self, trade_id: str, ticket: int,
+                            actual_exit: float, pnl_pips: float,
+                            reason: str):
+        """Broker-side close detected (SL/TP/manual).
+
+        Uses a neutral header — NOT notify_error() — so a profitable close
+        (trailing SL hit at +165 pips) does not appear as '⚠️ BOT ERROR'.
+        """
+        pnl_sign = "+" if pnl_pips >= 0 else ""
+        emoji = "✅" if pnl_pips >= 0 else "🔴"
+        text = (
+            f"{emoji} <b>BROKER CLOSE DETECTED</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Trade: <code>{trade_id}</code>\n"
+            f"Ticket: {ticket}\n"
+            f"Exit: ${actual_exit:.2f}\n"
+            f"PnL: {pnl_sign}{pnl_pips:.1f} pips\n"
+            f"Reason: {reason}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "(Closed by broker — full details below)"
+        )
+        self.send_sync(text)
+
     def notify_error(self, error_msg: str):
-        """Error notification."""
+        """Error notification — for genuine bot errors only.
+
+        Do NOT call this for trade opens/closes or broker alerts.
+        Those have dedicated methods (notify_trade_opened, notify_trade_closed,
+        notify_broker_alert) that use appropriate headers.
+        """
         text = f"⚠️ <b>BOT ERROR</b>\n<code>{error_msg[:500]}</code>"
         self.send_sync(text)
 

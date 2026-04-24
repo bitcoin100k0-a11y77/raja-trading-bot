@@ -68,6 +68,16 @@ class TradingDatabase:
         )
         """)
 
+        # Migration: add max_favorable_pips column for restart resilience.
+        # Give-back exit needs the trade's all-time peak to calculate pullback %.
+        # Without this column, max resets to 0 on restart and give-back fires too early.
+        try:
+            cursor.execute(
+                "ALTER TABLE trades ADD COLUMN max_favorable_pips REAL DEFAULT 0.0"
+            )
+        except Exception:
+            pass  # Column already exists — safe to ignore
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS trade_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

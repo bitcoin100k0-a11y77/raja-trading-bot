@@ -57,16 +57,9 @@ class Signal:
         return tp2_dist / self.risk_pips
 
 
-@dataclass
-class PendingC0:
-    """Pending order waiting for C0 confirmation after C1 rejection."""
-    c1_bar_index: int
-    direction: TradeDirection
-    entry_price: float  # C1 extreme (pending stop)
-    sl_price: float  # C1 wick extreme (opposite side)
-    sr_level: SRLevel
-    bars_waiting: int = 0
-    context: Dict[str, Any] = field(default_factory=dict)
+# NOTE: PendingC0 dataclass removed — the two-bar strategy queue has been replaced
+# with direct Signal generation on C1 close. MT5 pending_stop_orders (main.py) is now
+# the single source of truth for pending state. Structural invalidation runs every tick.
 
 
 class Strategy:
@@ -82,7 +75,9 @@ class Strategy:
     def __init__(self, config: StrategyConfig, analyzer: MarketAnalyzer):
         self.cfg = config
         self.analyzer = analyzer
-        self.pending_orders: List[PendingC0] = []
+        # Kept for compatibility with any external referencer (e.g. logs).
+        # Strategy no longer queues pending C0 — MT5 holds the pending stop directly.
+        self.pending_orders: list = []
 
     def generate_signals(self, df: pd.DataFrame,
                          market: MarketState,
@@ -91,49 +86,63 @@ class Strategy:
         """
         Main signal generation pipeline.
         Returns list of valid signals (usually 0-1 per bar).
+
+        CRITICAL — COMPLETED BAR RULE (live trading fix):
+        C1 and C0 detection use df.iloc[-2] (the last COMPLETED bar),
+        NOT df.iloc[-1] (the forming bar whose OHLC is still changing).
+        This matches backtest behavior where every bar is fully formed.
+        Without this, C1 entry/SL levels are wrong (based on incomplete
+        candle) and C0 direction checks are meaningless (bar not closed).
         """
-        if df.empty or len(df) < 10:
+        if df.empty or len(df) < 20:
             return []
 
         signals = []
         blocked = blocked_patterns or []
 
-        # Check session filter
-        utc_hour = df.index[-1].hour if hasattr(df.index[-1], 'hour') else 12
+        # Use wall-clock UTC for session checks, not bar timestamp hour.
+        # ICMarkets bar timestamps are EET (UTC+3) — df.index[-1].hour
+        # gives EET, shifting the session window 3 hours early.
+        utc_hour = datetime.now(timezone.utc).hour
         if not is_tradeable_session(utc_hour, self.cfg.session_start,
                                     self.cfg.session_end):
             logger.debug("Outside trading session, skipping signals")
             self._expire_pending_orders()
             return []
 
-        # Session blackout (skip NY overlap whipsaw zone)
+        # Session blackout (skip NY overlap whipsaw zone 11:00-14:00 UTC)
         blackout_start = getattr(self.cfg, 'session_blackout_start', 0)
         blackout_end = getattr(self.cfg, 'session_blackout_end', 0)
         if blackout_start and blackout_end and blackout_start <= utc_hour < blackout_end:
             logger.debug("Session blackout (NY overlap), skipping signals")
+            # 📵 KILL SWITCH — expire pending C1 orders at blackout entry.
+            # During the 3-hour blackout, _check_pending_c0 is never called so
+            # bars_waiting never increments. A C1 from 10:59 UTC would still have
+            # bars_waiting=0 at 14:00 UTC and fire on a 3-hour-stale bar as C0.
+            # The pending_expiry_bars=3 rule (45 min) can't enforce itself if the
+            # counter never ticks. Expire all pending at blackout entry instead.
+            self._expire_pending_orders()
             return []
 
-        # Current bar data
-        bar = df.iloc[-1]
-        prev_bar = df.iloc[-2] if len(df) >= 2 else bar
+        # === COMPLETED BAR — the last fully closed candle ===
+        # df.iloc[-1] = forming bar (OHLC still changing — DO NOT use for C1/C0)
+        # df.iloc[-2] = last completed bar (final OHLC — use for all entry logic)
+        completed_bar = df.iloc[-2]
+        prev_completed = df.iloc[-3] if len(df) >= 3 else completed_bar
 
-        # 1. Check pending C0 orders first
-        c0_signals = self._check_pending_c0(bar, df, market)
-        signals.extend(c0_signals)
+        # 1. Scan for C1 rejection — builds direct stop-order Signals (no 2-bar wait)
+        c1_signals = self._scan_c1_rejection(completed_bar, df, market)
+        signals.extend(c1_signals)
 
-        # 2. Scan for new C1 rejection setups
-        c1_signals = self._scan_c1_rejection(bar, df, market)
-        # C1 creates pending orders, not immediate signals
-
-        # 3. Impulse entry (if enabled)
+        # 3. Impulse entry (if enabled) — also on completed bar
         if self.cfg.impulse_enabled:
-            imp_signal = self._scan_impulse(bar, prev_bar, df, market)
+            imp_signal = self._scan_impulse(completed_bar, prev_completed, df, market)
             if imp_signal:
                 signals.append(imp_signal)
 
-        # 4. Break & Retest (if enabled)
+        # 4. Break & Retest (if enabled) — also on completed bar
         if self.cfg.break_retest_enabled:
-            br_signal = self._scan_break_retest(bar, df, market)
+            br_signal = self._scan_break_retest(completed_bar, df, market)
             if br_signal:
                 signals.append(br_signal)
 
@@ -142,11 +151,11 @@ class Strategy:
             sig.context["trend"] = market.trend.value
             sig.context["session"] = market.session.value
 
-        # Apply pre-entry filters and fakeout detection
+        # Apply pre-entry filters and fakeout detection (using completed bar)
         filtered = []
         for sig in signals:
             if self._passes_pre_entry_filters(sig, market, df):
-                if not self._is_fakeout(sig, bar, df, market):
+                if not self._is_fakeout(sig, completed_bar, df, market):
                     filtered.append(sig)
                 else:
                     logger.info("Signal rejected: fakeout detected for %s at %.2f",
@@ -160,164 +169,178 @@ class Strategy:
     # === ENTRY TYPE 1: C1/C0 REJECTION ===
 
     def _scan_c1_rejection(self, bar: pd.Series, df: pd.DataFrame,
-                           market: MarketState):
+                           market: MarketState) -> List[Signal]:
         """
-        Scan for C1 rejection candle at S/R zone.
-        C1 = candle that rejects off S/R with wick into zone and body closing away.
-        If valid, creates a pending C0 order.
+        Scan for C1 rejection candle at S/R zone and emit a stop-order Signal
+        immediately on C1 close.
+
+        🔴 NEW TIMING MODEL (Raja original): C1 closes → Signal with is_stop_order=True
+        built right here → main.py places MT5 BUY_STOP/SELL_STOP within the same tick.
+        The next forming candle (C0) either triggers the fill, breaches C1 wick
+        (structural invalidation in main.py), or times out (_expire_pending_stops).
+
+        No more strategy-level queue. No more C0 close-based gate validation.
+
+        CRITICAL: `bar` must be the last COMPLETED bar (df.iloc[-2]), NOT the forming bar.
         """
+        signals: List[Signal] = []
+
         o, h, l, c = float(bar["Open"]), float(bar["High"]), \
                       float(bar["Low"]), float(bar["Close"])
 
         br = body_ratio(o, c, h, l)
         if br < self.cfg.c1_body_min:
             logger.debug("C1 scan: body_ratio %.2f < min %.2f, skip", br, self.cfg.c1_body_min)
-            return  # Not enough body
+            return signals  # Not enough body
 
         c1_range_pips = price_to_pips(h - l)
         if c1_range_pips < self.cfg.c1_min_range_pips:
-            logger.debug("C1 scan: range %.1f pips < min %.1f, skip", c1_range_pips, self.cfg.c1_min_range_pips)
-            return  # Candle too small
+            logger.debug("C1 scan: range %.1f pips < min %.1f, skip",
+                         c1_range_pips, self.cfg.c1_min_range_pips)
+            return signals  # Candle too small
 
         logger.info("C1 candidate: O=%.2f H=%.2f L=%.2f C=%.2f | body=%.2f range=%.1f pips | %s",
                      o, h, l, c, br, c1_range_pips, "BULL" if is_bullish(o, c) else "BEAR")
 
         tol = self.cfg.rejection_tolerance
+        buffer_price = pips_to_price(self.cfg.c1_stop_buffer_pips)
 
-        # Check against support levels (bullish rejection) — asymmetric tolerance
-        # Wick must dip INTO the support zone: C1_low within [level - tol*2, level + tol]
-        # Body must close above level (rejection = bullish close away from zone)
+        # Per-bar dedup: one signal per (zone, direction). main.py's
+        # pending_stop_orders dict prevents duplicates across bars (once an MT5
+        # pending for a zone is live, a subsequent C1 will land via place_stop_order
+        # as a new ticket — rely on reconciler + expiry for overlap cleanup).
+        seen_zones = set()
+
+        # === BULLISH C1 → check against SUPPORT levels ===
+        # Wick must dip INTO the support zone: C1_low within [level - tol, level + tol]
+        # Body must close above level (rejection = bullish close away from zone).
         if is_bullish(o, c):
-            logger.info("C1 scan: checking %d support levels (tol=$%.1f)", len(market.support_levels), tol)
+            logger.info("C1 scan: checking %d support levels (tol=$%.1f)",
+                        len(market.support_levels), tol)
             for level in sorted(market.support_levels, key=lambda x: x.price, reverse=True):
-                wick_ok = l <= level.price + tol and l >= level.price - tol * 2
+                wick_ok = l <= level.price + tol and l >= level.price - tol
                 logger.debug("  SUP $%.2f: low=$%.2f, range=[%.2f, %.2f], wick_ok=%s",
-                             level.price, l, level.price - tol * 2, level.price + tol, wick_ok)
-                if wick_ok:
-                    body_bottom = min(o, c)
-                    body_ok = body_bottom > level.price - tol * 0.5
-                    logger.info("  SUP $%.2f: wick IN zone! body_bottom=$%.2f, need>$%.2f, body_ok=%s",
-                                level.price, body_bottom, level.price - tol * 0.5, body_ok)
-                    if body_ok:
-                        entry = h  # Pending buy stop above C1 high
-                        sl = l  # SL at C1 low (no buffer — matches backtest)
+                             level.price, l, level.price - tol, level.price + tol, wick_ok)
+                if not wick_ok:
+                    continue
 
-                        pending = PendingC0(
-                            c1_bar_index=len(df) - 1,
-                            direction=TradeDirection.BUY,
-                            entry_price=entry,
-                            sl_price=sl,
-                            sr_level=level,
-                            context={
-                                "c1_body_ratio": br,
-                                "c1_range_pips": c1_range_pips,
-                                "c1_open": o, "c1_high": h,
-                                "c1_low": l, "c1_close": c,
-                                "c1_is_wickless": is_wickless(o, c, h, l),
-                            }
-                        )
-                        self.pending_orders.append(pending)
-                        logger.info("C1 bullish rejection at support %.2f, pending buy stop at %.2f",
-                                    level.price, entry)
-                        break  # Only take first matching level (nearest)
+                body_bottom = min(o, c)
+                body_ok = body_bottom >= level.price - tol * 0.15
+                logger.info("  SUP $%.2f: wick IN zone! body_bottom=$%.2f, need>=$%.2f (close-away), body_ok=%s",
+                            level.price, body_bottom, level.price - tol * 0.15, body_ok)
+                if not body_ok:
+                    continue
 
-        # Check against resistance levels (bearish rejection) — asymmetric tolerance
-        # Wick must poke INTO resistance zone: C1_high within [level - tol, level + tol*2]
-        # Body must close below level (rejection = bearish close away from zone)
-        if is_bearish(o, c):
-            logger.info("C1 scan: checking %d resistance levels (tol=$%.1f)", len(market.resistance_levels), tol)
-            for level in sorted(market.resistance_levels, key=lambda x: x.price):
-                wick_ok = h >= level.price - tol and h <= level.price + tol * 2
-                logger.debug("  RES $%.2f: high=$%.2f, range=[%.2f, %.2f], wick_ok=%s",
-                             level.price, h, level.price - tol, level.price + tol * 2, wick_ok)
-                if wick_ok:
-                    body_top = max(o, c)
-                    body_ok = body_top < level.price + tol * 0.5
-                    logger.info("  RES $%.2f: wick IN zone! body_top=$%.2f, need<$%.2f, body_ok=%s",
-                                level.price, body_top, level.price + tol * 0.5, body_ok)
-                    if body_ok:
-                        entry = l  # Pending sell stop below C1 low
-                        sl = h  # SL at C1 high (no buffer — matches backtest)
+                zone_key = (level.price, TradeDirection.BUY)
+                if zone_key in seen_zones:
+                    break
+                seen_zones.add(zone_key)
 
-                        pending = PendingC0(
-                            c1_bar_index=len(df) - 1,
-                            direction=TradeDirection.SELL,
-                            entry_price=entry,
-                            sl_price=sl,
-                            sr_level=level,
-                            context={
-                                "c1_body_ratio": br,
-                                "c1_range_pips": c1_range_pips,
-                                "c1_open": o, "c1_high": h,
-                                "c1_low": l, "c1_close": c,
-                                "c1_is_wickless": is_wickless(o, c, h, l),
-                            }
-                        )
-                        self.pending_orders.append(pending)
-                        logger.info("C1 bearish rejection at resistance %.2f, pending sell stop at %.2f",
-                                    level.price, entry)
-                        break  # Only take first matching level (nearest)
-
-    def _check_pending_c0(self, bar: pd.Series, df: pd.DataFrame,
-                          market: MarketState) -> List[Signal]:
-        """
-        Check if current bar triggers any pending C0 orders.
-        C0 = the confirmation candle that triggers the pending stop.
-        """
-        signals = []
-        still_pending = []
-
-        for pending in self.pending_orders:
-            pending.bars_waiting += 1
-
-            # Expire if too many bars
-            if pending.bars_waiting > self.cfg.pending_expiry_bars:
-                logger.debug("Pending C0 expired after %d bars",
-                             pending.bars_waiting)
-                continue
-
-            triggered = False
-            if pending.direction == TradeDirection.BUY:
-                # Buy stop: triggered if bar's high >= entry price
-                if float(bar["High"]) >= pending.entry_price:
-                    triggered = True
-            else:
-                # Sell stop: triggered if bar's low <= entry price
-                if float(bar["Low"]) <= pending.entry_price:
-                    triggered = True
-
-            if triggered:
-                risk_pips = price_to_pips(
-                    abs(pending.entry_price - pending.sl_price)
-                )
-
-                # Calculate TP levels
-                tp1, tp2 = self._calculate_tp(
-                    pending.direction, pending.entry_price,
-                    risk_pips, market
-                )
+                # 🔴 Stop order = C1 high + buffer (break of rejection). SL = C1 low.
+                stop_entry = h + buffer_price
+                stop_sl    = l
+                risk_pips  = price_to_pips(stop_entry - stop_sl)
+                tp1, tp2 = self._calculate_tp(TradeDirection.BUY, stop_entry,
+                                              risk_pips, market)
 
                 signal = Signal(
-                    trade_id=f"C1C0-{uuid.uuid4().hex[:8]}",
-                    direction=pending.direction,
+                    trade_id=f"C1STOP-{uuid.uuid4().hex[:8]}",
+                    direction=TradeDirection.BUY,
                     entry_type=EntryType.C1_C0_REJECTION,
-                    entry_price=pending.entry_price,
-                    sl_price=pending.sl_price,
+                    entry_price=stop_entry,
+                    sl_price=stop_sl,
                     tp1_price=tp1,
                     tp2_price=tp2,
                     risk_pips=risk_pips,
-                    sr_level=pending.sr_level,
-                    context=pending.context,
+                    sr_level=level,
+                    context={
+                        "c1_body_ratio":     br,
+                        "c1_range_pips":     c1_range_pips,
+                        "c1_open":  o, "c1_high": h, "c1_low": l, "c1_close": c,
+                        "c1_is_wickless":    is_wickless(o, c, h, l),
+                        "c1_bar_time":       bar.name,
+                        "is_stop_order":     True,    # routes to place_stop_order
+                        "stop_buffer_pips":  self.cfg.c1_stop_buffer_pips,
+                        "stop_expiry_bars":  self.cfg.pending_expiry_bars,
+                        "invalidation_price": stop_sl,  # 🔴 tick below C1_low = setup dead
+                    },
                 )
                 signals.append(signal)
-                logger.info("C0 triggered! %s at %.2f, SL %.2f, TP1 %.2f",
-                            pending.direction.value, pending.entry_price,
-                            pending.sl_price, tp1)
-            else:
-                still_pending.append(pending)
+                logger.info(
+                    "C1 bullish → BUY_STOP %.2f SL %.2f risk %.1fp (zone %.2f)",
+                    stop_entry, stop_sl, risk_pips, level.price
+                )
+                break  # Only take nearest matching level
 
-        self.pending_orders = still_pending
+        # === BEARISH C1 → check against RESISTANCE levels ===
+        # Wick must poke INTO resistance zone: C1_high within [level - tol, level + tol]
+        # Body must close below level (rejection = bearish close away from zone).
+        if is_bearish(o, c):
+            logger.info("C1 scan: checking %d resistance levels (tol=$%.1f)",
+                        len(market.resistance_levels), tol)
+            for level in sorted(market.resistance_levels, key=lambda x: x.price):
+                wick_ok = h >= level.price - tol and h <= level.price + tol
+                logger.debug("  RES $%.2f: high=$%.2f, range=[%.2f, %.2f], wick_ok=%s",
+                             level.price, h, level.price - tol, level.price + tol, wick_ok)
+                if not wick_ok:
+                    continue
+
+                body_top = max(o, c)
+                body_ok = body_top <= level.price + tol * 0.15
+                logger.info("  RES $%.2f: wick IN zone! body_top=$%.2f, need<=$%.2f (close-away), body_ok=%s",
+                            level.price, body_top, level.price + tol * 0.15, body_ok)
+                if not body_ok:
+                    continue
+
+                zone_key = (level.price, TradeDirection.SELL)
+                if zone_key in seen_zones:
+                    break
+                seen_zones.add(zone_key)
+
+                # 🔴 Stop order = C1 low - buffer (break of rejection). SL = C1 high.
+                stop_entry = l - buffer_price
+                stop_sl    = h
+                risk_pips  = price_to_pips(stop_sl - stop_entry)
+                tp1, tp2 = self._calculate_tp(TradeDirection.SELL, stop_entry,
+                                              risk_pips, market)
+
+                signal = Signal(
+                    trade_id=f"C1STOP-{uuid.uuid4().hex[:8]}",
+                    direction=TradeDirection.SELL,
+                    entry_type=EntryType.C1_C0_REJECTION,
+                    entry_price=stop_entry,
+                    sl_price=stop_sl,
+                    tp1_price=tp1,
+                    tp2_price=tp2,
+                    risk_pips=risk_pips,
+                    sr_level=level,
+                    context={
+                        "c1_body_ratio":     br,
+                        "c1_range_pips":     c1_range_pips,
+                        "c1_open":  o, "c1_high": h, "c1_low": l, "c1_close": c,
+                        "c1_is_wickless":    is_wickless(o, c, h, l),
+                        "c1_bar_time":       bar.name,
+                        "is_stop_order":     True,
+                        "stop_buffer_pips":  self.cfg.c1_stop_buffer_pips,
+                        "stop_expiry_bars":  self.cfg.pending_expiry_bars,
+                        "invalidation_price": stop_sl,  # 🔴 tick above C1_high = setup dead
+                    },
+                )
+                signals.append(signal)
+                logger.info(
+                    "C1 bearish → SELL_STOP %.2f SL %.2f risk %.1fp (zone %.2f)",
+                    stop_entry, stop_sl, risk_pips, level.price
+                )
+                break
+
         return signals
+
+    # NOTE: _check_pending_c0 removed (2026-04-24).
+    # Old flow waited for C0 bar to CLOSE, ran 3 gates (distance/wick/direction),
+    # THEN placed MT5 stop — a 15-min lag that killed most setups before the order
+    # was even live. New flow: _scan_c1_rejection builds the stop Signal directly
+    # on C1 close. Structural invalidation (main.py._check_stop_invalidation) and
+    # time expiry (main.py._expire_pending_stops) govern the lifecycle thereafter.
 
     # === ENTRY TYPE 2: IMPULSE ===
 
@@ -543,6 +566,16 @@ class Strategy:
         3. SL within bounds (min_sl_pips, max_risk_pips)
         4. Spread check
         """
+        # Diagnostic — log every signal entering pre-filter pipeline so zero-trade
+        # investigations can see which filter dropped it (all reject paths INFO).
+        logger.info(
+            "Pre-filter CHECK: %s entry=%.2f SL=%.2f risk=%.1fp "
+            "(%s zone=%.2f strength=%.1f)",
+            signal.direction.value, signal.entry_price, signal.sl_price,
+            signal.risk_pips, signal.entry_type.value,
+            signal.sr_level.price, signal.sr_level.strength,
+        )
+
         # 1. Room to opposing S/R
         room = self.analyzer.get_room_to_opposing(
             signal.direction.value, signal.entry_price,
@@ -563,24 +596,36 @@ class Strategy:
                 mid_low = 0.5 - self.cfg.max_mid_range_pct / 2
                 mid_high = 0.5 + self.cfg.max_mid_range_pct / 2
                 if mid_low < position < mid_high:
-                    logger.debug("Rejected: mid-range position %.2f", position)
+                    logger.info(
+                        "Pre-filter REJECT: mid-range position %.2f "
+                        "(band=%.2f-%.2f, entry=%.2f)",
+                        position, mid_low, mid_high, signal.entry_price
+                    )
                     return False
 
         # 3. SL bounds - reject signals outside range (no padding)
         if signal.risk_pips < self.cfg.min_sl_pips:
-            logger.debug("Rejected: SL too tight %.1f pips (need large C1 for conviction)", signal.risk_pips)
+            logger.info(
+                "Pre-filter REJECT: SL too tight %.1f pips < min %.1f "
+                "(entry=%.2f, %s)",
+                signal.risk_pips, self.cfg.min_sl_pips,
+                signal.entry_price, signal.direction.value
+            )
             return False
         if signal.risk_pips > self.cfg.max_risk_pips:
-            logger.debug("Rejected: SL too wide %.1f pips", signal.risk_pips)
+            logger.info(
+                "Pre-filter REJECT: SL too wide %.1f pips > max %.1f "
+                "(entry=%.2f, %s)",
+                signal.risk_pips, self.cfg.max_risk_pips,
+                signal.entry_price, signal.direction.value
+            )
             return False
 
-        # 4. HTF alignment bonus (soft filter) — channel method already
-        # selects strong zones, so we only reject truly weak channels
-        # with no HTF alignment AND very low strength score
-        if not signal.sr_level.htf_aligned and signal.sr_level.strength < 10:
-            logger.info("Pre-filter REJECT: S/R channel too weak (strength=%.1f, no HTF)",
-                         signal.sr_level.strength)
-            return False
+        # 4. HTF alignment + strength filter REMOVED per entry-plan update.
+        # Reason: body-touch filter + pivot strength already filter zone quality upstream.
+        # The HTF+strength gate was blocking orphan-but-valid zones from reacting.
+        # Stop-order entry at C1 extreme provides its own confirmation (price must
+        # break the C1 wick to trigger fill), so we no longer need this soft filter.
 
         logger.info("Pre-filter PASSED: room=%.1f, risk=%.1f pips, sr_str=%.1f, htf=%s",
                      room, signal.risk_pips, signal.sr_level.strength, signal.sr_level.htf_aligned)
@@ -647,31 +692,48 @@ class Strategy:
 
         if direction == TradeDirection.BUY:
             tp1 = entry + tp1_dollars
-            # TP2: nearest resistance or max RR
+            # TP2: nearest resistance BEYOND TP1, or max 2.5R fallback
             tp2_max = entry + risk_dollars * self.cfg.tp2_max_rr
             nearest_res = self.analyzer.get_nearest_resistance(
                 market.resistance_levels, entry
             )
-            if nearest_res and nearest_res.price < tp2_max:
+            # 🔴 LIVE RISK — S/R zone must be FARTHER than TP1 (beyond TP1 in profit
+            # direction). Without this guard, a tight S/R just above entry overrides
+            # the TP2 max and produces a TP2 that is closer than TP1.
+            if nearest_res and nearest_res.price > tp1 and nearest_res.price < tp2_max:
                 tp2 = nearest_res.price
+                logger.debug("TP2 BUY: using S/R at %.2f (beyond TP1 %.2f, inside 2.5R %.2f)",
+                             tp2, tp1, tp2_max)
             else:
                 tp2 = tp2_max
+                logger.debug("TP2 BUY: using 2.5R max %.2f (no valid S/R beyond TP1)", tp2)
         else:
             tp1 = entry - tp1_dollars
+            # TP2: nearest support BEYOND TP1, or max 2.5R fallback
             tp2_max = entry - risk_dollars * self.cfg.tp2_max_rr
             nearest_sup = self.analyzer.get_nearest_support(
                 market.support_levels, entry
             )
-            if nearest_sup and nearest_sup.price > tp2_max:
+            # 🔴 LIVE RISK — S/R zone must be FARTHER than TP1 (below TP1 for SELL).
+            # Without this guard, the nearest support just below entry (which may be
+            # 1-2 price units away) gets used as TP2, producing a worse-than-1:1 trade.
+            if nearest_sup and nearest_sup.price < tp1 and nearest_sup.price > tp2_max:
                 tp2 = nearest_sup.price
+                logger.debug("TP2 SELL: using S/R at %.2f (beyond TP1 %.2f, inside 2.5R %.2f)",
+                             tp2, tp1, tp2_max)
             else:
                 tp2 = tp2_max
+                logger.debug("TP2 SELL: using 2.5R max %.2f (no valid S/R beyond TP1)", tp2)
 
         return round(tp1, 2), round(tp2, 2)
 
     def _expire_pending_orders(self):
-        """Expire all pending orders (called outside trading hours)."""
+        """Compatibility shim — strategy no longer holds a pending queue.
+
+        Retained so external callers (main.py session-boundary cleanup) stay safe
+        if not yet updated. MT5 pending lifetime is governed by
+        main.py._expire_pending_stops() and _check_stop_invalidation().
+        """
         if self.pending_orders:
-            logger.info("Expiring %d pending orders (outside session)",
-                        len(self.pending_orders))
+            # Defensive — any stale in-memory state from prior code paths.
             self.pending_orders.clear()
