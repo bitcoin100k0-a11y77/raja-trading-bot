@@ -694,14 +694,30 @@ class MT5Executor:
         else:
             order_type = mt5.ORDER_TYPE_SELL_STOP
 
-        # Validate / push SL+TP to meet broker minimum distance from trigger
+        # 🔴 LIVE RISK — Send TP=TP2 to broker (not TP1).
+        # Bot handles TP1 partial close (50%) internally via trade_manager on every tick.
+        # Broker holds TP2 as the safety net: if bot crashes after fill, the
+        # position still closes at full target instead of running forever.
         sl_adj, tp_adj = self._validate_stops_distance(
-            signal.entry_price, signal.sl_price, signal.tp1_price,
+            signal.entry_price, signal.sl_price, signal.tp2_price,
             signal.direction,
         )
         signal.sl_price = sl_adj  # keep Signal in sync
-        # Note: we send TP1 as the MT5 TP on stop orders (simple; no partial
-        # logic applies until position is open + trade_manager takes over).
+
+        # 🔴 LIVE RISK — Compute broker-side expiry capability.
+        # Bot's _expire_pending_stops is the primary canceler; broker-side expiration is
+        # defense-in-depth for the case where bot crashes mid-bar.
+        # ICMarkets and many retail brokers do NOT advertise SYMBOL_EXPIRATION_SPECIFIED
+        # in their bitmask — sending ORDER_TIME_SPECIFIED then triggers retcode 10022
+        # ("Invalid expiration"). Fall back to GTC when SPECIFIED unsupported.
+        expiry_bars = signal.context.get("stop_expiry_bars", self.cfg.strategy.pending_expiry_bars)
+        expiration_ts = int(time.time()) + (expiry_bars * 15 * 60) + 60
+
+        # Bitmask: 1=GTC, 2=DAY, 4=SPECIFIED, 8=SPECIFIED_DAY
+        # Use literal 4 in case the named constant is missing on older mt5 module versions.
+        exp_mode = getattr(symbol_info, "expiration_mode", 0) or 0
+        SYMBOL_EXP_SPECIFIED = getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4)
+        supports_specified = bool(exp_mode & SYMBOL_EXP_SPECIFIED)
 
         digits = self.mt5_conn._digits
         request = {
@@ -715,14 +731,21 @@ class MT5Executor:
             "deviation": self.cfg.mt5.max_slippage,
             "magic": self.cfg.mt5.magic_number,
             "comment": f"ANiSTOP_{signal.trade_id[:8]}",
-            "type_time": mt5.ORDER_TIME_GTC,  # We cancel manually on expiry
             "type_filling": self._get_filling_mode(),
         }
 
+        if supports_specified:
+            request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+            request["expiration"] = expiration_ts
+            expiry_log = f"expires={expiration_ts - int(time.time())}s (broker)"
+        else:
+            request["type_time"] = mt5.ORDER_TIME_GTC
+            expiry_log = f"GTC (broker mode={exp_mode}, bot cancels in {expiry_bars} bars)"
+
         logger.info(
-            "🔴 PLACING STOP: %s %.2f lots | trigger=%.2f SL=%.2f TP=%.2f | Magic=%d",
+            "🔴 PLACING STOP: %s %.2f lots | trigger=%.2f SL=%.2f TP=%.2f | %s | Magic=%d",
             signal.direction.value, lots, signal.entry_price,
-            sl_adj, tp_adj, self.cfg.mt5.magic_number
+            sl_adj, tp_adj, expiry_log, self.cfg.mt5.magic_number
         )
 
         result = mt5.order_send(request)
@@ -731,6 +754,24 @@ class MT5Executor:
             logger.error("Stop order order_send returned None: %s", err)
             self._alert(f"❌ STOP ORDER FAILED (None): {err}")
             return None
+
+        # 🔴 LIVE RISK — Retcode 10022 = TRADE_RETCODE_INVALID_EXPIRATION.
+        # Some brokers advertise SYMBOL_EXPIRATION_SPECIFIED in the bitmask but
+        # still reject the actual timestamp (per-instrument or per-account quirks).
+        # Auto-retry once with GTC fallback so the trade still fires.
+        if result.retcode == 10022 and request.get("type_time") == mt5.ORDER_TIME_SPECIFIED:
+            logger.warning(
+                "Stop order rejected with 10022 (Invalid expiration) despite "
+                "broker advertising SPECIFIED support. Retrying with GTC..."
+            )
+            request.pop("expiration", None)
+            request["type_time"] = mt5.ORDER_TIME_GTC
+            result = mt5.order_send(request)
+            if result is None:
+                err = mt5.last_error()
+                logger.error("Stop order GTC retry returned None: %s", err)
+                self._alert(f"❌ STOP ORDER FAILED (GTC retry, None): {err}")
+                return None
 
         if result.retcode != TRADE_RETCODE_DONE:
             logger.error(
@@ -789,25 +830,30 @@ class MT5Executor:
     # SL MODIFICATION (for 3-stage SL system)
     # ============================================================
 
-    def modify_sl(self, trade_id: str, new_sl: float) -> bool:
+    def modify_sl(self, trade_id: str, new_sl: float) -> Optional[float]:
         """
         🔴 LIVE RISK — Modify stop loss on an existing MT5 position.
         Used by the 3-stage SL system.
+
+        Returns the actual SL price set on the broker (may be clamped if the
+        target was within broker minimum distance), or None if the modify failed
+        completely (ticket not found, position gone, or unexpected retcode).
+        Caller must update trade.sl_price with the returned value.
         """
         if not self.cfg.live_mode:
             logger.info("🔒 SHADOW: Would modify SL for %s to %.2f", trade_id, new_sl)
-            return True
+            return new_sl
 
         ticket = self._ticket_map.get(trade_id)
         if ticket is None:
             logger.warning("No MT5 ticket found for trade %s", trade_id)
-            return False
+            return None
 
         # Get current position to preserve TP
         positions = mt5.positions_get(ticket=ticket)
         if not positions or len(positions) == 0:
             logger.warning("Position %d not found in MT5", ticket)
-            return False
+            return None
 
         pos = positions[0]
 
@@ -827,12 +873,24 @@ class MT5Executor:
             current_price = pos.price_current
             sl_distance = abs(current_price - new_sl)
             if sl_distance < min_distance:
-                logger.warning(
-                    "SL modify too close to market: new_sl=%.2f, price=%.2f, "
-                    "dist=%.2f pts, min=%.2f pts — caller must revert and retry next tick.",
-                    new_sl, current_price, sl_distance, min_distance
+                # 🔴 LIVE RISK — target SL is within broker minimum distance.
+                # Auto-clamp to just outside minimum so the stage still advances.
+                # This happens when a profitable trade's price hovers near the
+                # C0 extreme (Stage 2 target). Clamping avoids the infinite
+                # 30-second retry loop while still tightening the SL from Stage 1.
+                original_target = new_sl
+                clamp_dist = min_distance * 1.2  # 20% buffer over broker minimum
+                is_buy = (pos.type == getattr(mt5, "POSITION_TYPE_BUY", 0))
+                if is_buy:
+                    new_sl = round(current_price - clamp_dist, self.mt5_conn._digits)
+                else:
+                    new_sl = round(current_price + clamp_dist, self.mt5_conn._digits)
+                logger.info(
+                    "SL clamped to broker min: target=%.2f → clamped=%.2f "
+                    "(dist=%.2f < min=%.2f, price=%.2f, %s)",
+                    original_target, new_sl, sl_distance, min_distance,
+                    current_price, "BUY" if is_buy else "SELL",
                 )
-                return False
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -850,12 +908,9 @@ class MT5Executor:
             retcode = result.retcode if result else -1
             error = result.comment if result else str(mt5.last_error())
             if retcode == TRADE_RETCODE_INVALID_STOPS:
-                # 🔴 LIVE RISK — broker's dynamic minimum rejected the move.
-                # Caller should revert stage/price so next tick retries.
                 logger.warning(
                     "SL modify INVALID_STOPS: ticket=%d, new_sl=%.2f "
-                    "— price may have pulled back inside broker minimum. "
-                    "Will retry when price moves far enough.",
+                    "— broker rejected even clamped SL. Caller will revert.",
                     ticket, new_sl
                 )
             else:
@@ -863,10 +918,10 @@ class MT5Executor:
                     "SL modify FAILED: ticket=%d, retcode=%d, error=%s",
                     ticket, retcode, error
                 )
-            return False
+            return None
 
         logger.info("SL modified OK: ticket=%d -> %.2f", ticket, new_sl)
-        return True
+        return new_sl
 
     def modify_tp(self, trade_id: str, new_tp: float) -> bool:
         """Modify take profit on an existing MT5 position (for TP2 after TP1)."""
@@ -883,6 +938,10 @@ class MT5Executor:
             return False
 
         pos = positions[0]
+
+        if abs(pos.tp - new_tp) < 0.01:
+            logger.debug("TP already at %.2f for ticket %d — skip modify", new_tp, ticket)
+            return True
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -1053,9 +1112,23 @@ class MT5Executor:
                     self.close_position(trade_id,
                                        reason.value if hasattr(reason, "value") else str(reason))
                 elif not full_close:
-                    # Partial close (TP1)
-                    self.partial_close(trade_id, lots_closed, "TP1")
-                    # Update TP to TP2 on remaining position
+                    # Partial close (TP1) — only proceed if partial_close succeeds.
+                    # If lot rounding forces full size (< broker min lot), skip partial
+                    # so trade continues on full size rather than closing 100% unintentionally.
+                    partial_ok = self.partial_close(trade_id, lots_closed, "TP1")
+                    if not partial_ok:
+                        # Revert tp1_hit so trade_manager re-checks next tick
+                        active = self.trade_mgr.active_trades.get(trade_id)
+                        if active:
+                            active.tp1_hit = False
+                        logger.warning(
+                            "TP1 partial close failed for %s — tp1_hit reverted, "
+                            "trade continues full size toward TP2", trade_id
+                        )
+                        return
+                    # TP already set to TP2 on broker (placed via place_stop_order with TP2).
+                    # modify_tp is a no-op if already correct, but call anyway to guard
+                    # against broker-side TP drift (slippage, manual edits, etc.).
                     active = self.trade_mgr.active_trades.get(trade_id)
                     if active and active.tp2_price:
                         self.modify_tp(trade_id, active.tp2_price)

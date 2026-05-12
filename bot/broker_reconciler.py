@@ -17,7 +17,7 @@ Flow:
 5. Return report for Telegram
 """
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -29,6 +29,7 @@ except ImportError:
 from database import TradingDatabase
 from trade_manager import TradeManager, ActiveTrade
 from constants import TradeDirection, SLStage
+from utils import price_to_pips, get_session, get_4h_candle_number
 
 logger = logging.getLogger(__name__)
 
@@ -306,3 +307,130 @@ class BrokerReconciler:
         except Exception as e:
             logger.error("check_stop_fills failed: %s", e)
         return gone
+
+    def register_filled_stops(
+        self,
+        pending_stop_orders: Dict[int, Dict[str, Any]],
+        db: TradingDatabase,
+        trade_mgr: TradeManager,
+        ticket_map: Dict[str, int],
+    ) -> Tuple[List[Tuple[str, int]], List[int]]:
+        """
+        🔁 RECONCILE (runtime) — Detect pending stop orders filled into positions.
+
+        For filled stops: register DB row + ActiveTrade + remap ticket to position.
+        For canceled stops (gone with no matching position): return for cleanup.
+
+        Returns:
+            (registered, canceled)
+            registered: [(trade_id, position_ticket), ...] — stops that filled
+            canceled: [pending_ticket, ...] — stops that disappeared without fill
+        """
+        registered: List[Tuple[str, int]] = []
+        canceled: List[int] = []
+
+        if not pending_stop_orders or mt5 is None:
+            return registered, canceled
+
+        try:
+            live_orders = mt5.orders_get(symbol=self.symbol) or []
+            live_tickets = {o.ticket for o in live_orders if o.magic == self.magic_number}
+
+            # Index positions by comment key (8-char trade_id prefix)
+            positions = self._get_mt5_positions()
+            pos_by_key: Dict[str, dict] = {}
+            for pos in positions:
+                key = self._extract_trade_id(pos.get("comment", ""))
+                if key:
+                    pos_by_key[key] = pos
+
+            for pending_ticket, pdata in list(pending_stop_orders.items()):
+                if pending_ticket in live_tickets:
+                    continue  # Still pending
+
+                sig = pdata["signal"]
+                comment_key = sig.trade_id[:8]
+                pos = pos_by_key.get(comment_key)
+
+                if pos is None:
+                    canceled.append(pending_ticket)
+                    logger.info("🔁 Stop %d canceled (no matching position)", pending_ticket)
+                    continue
+
+                # Double-call guard
+                if sig.trade_id in trade_mgr.active_trades:
+                    continue
+
+                position_ticket = pos["ticket"]
+                actual_price = pos["price_open"]
+                actual_volume = pos["volume"]
+
+                # Remap: pending order ticket → live position ticket
+                ticket_map[sig.trade_id] = position_ticket
+
+                actual_risk_pips = price_to_pips(abs(actual_price - sig.sl_price))
+                if actual_risk_pips <= 0:
+                    actual_risk_pips = sig.risk_pips
+
+                now = datetime.now(timezone.utc)
+
+                # Register in TradeManager so SL staging / TP monitoring activates
+                active = ActiveTrade(
+                    trade_id=sig.trade_id,
+                    direction=sig.direction,
+                    entry_price=actual_price,
+                    lot_size=actual_volume,
+                    sl_price=sig.sl_price,
+                    sl_stage=SLStage.STAGE_1,
+                    tp1_price=sig.tp1_price,
+                    tp2_price=sig.tp2_price,
+                    c0_extreme=None,  # Stop-order model has no C0 bar; Stage 2 uses conservative fallback
+                )
+                trade_mgr.open_trade(active)
+
+                # Persist to DB (mirrors execute_signal registration)
+                trade_record: Dict[str, Any] = {
+                    "trade_id": sig.trade_id,
+                    "symbol": self.symbol,
+                    "direction": sig.direction.value,
+                    "entry_type": sig.entry_type.value,
+                    "entry_price": actual_price,
+                    "lot_size": actual_volume,
+                    "sl_initial": sig.sl_price,
+                    "sl_current": sig.sl_price,
+                    "sl_stage": 1,
+                    "tp1_price": sig.tp1_price,
+                    "tp2_price": sig.tp2_price,
+                    "risk_pips": actual_risk_pips,
+                    "risk_percent": pdata.get("risk_percent", 0.0),
+                    "balance_before": pdata.get("balance_before", 0.0),
+                    "entry_time": now.isoformat(),
+                    "session_type": get_session(now.hour).value,
+                    "four_h_candle": get_4h_candle_number(now.hour),
+                }
+                db.insert_trade(trade_record)
+
+                # Persist signal context
+                ctx = sig.context
+                context_record: Dict[str, Any] = {
+                    "trade_id": sig.trade_id,
+                    "sr_level_price": sig.sr_level.price,
+                    "sr_level_type": sig.sr_level.zone_type.value,
+                    "sr_touches": sig.sr_level.touches,
+                    "confidence_score": sig.confidence,
+                    "c1_body_ratio": ctx.get("c1_body_ratio", 0),
+                    "c1_range_pips": ctx.get("c1_range_pips", 0),
+                    "c1_is_wickless": 1 if ctx.get("c1_is_wickless") else 0,
+                }
+                db.insert_context(context_record)
+
+                registered.append((sig.trade_id, position_ticket))
+                logger.info(
+                    "🔁 Stop filled → registered: %s ticket=%d entry=%.2f lots=%.2f",
+                    sig.trade_id, position_ticket, actual_price, actual_volume,
+                )
+
+        except Exception as e:
+            logger.error("register_filled_stops failed: %s", e)
+
+        return registered, canceled

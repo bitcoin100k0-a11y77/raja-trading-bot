@@ -341,7 +341,9 @@ class TradeManager:
 
         elif trade.sl_stage == SLStage.STAGE_3 and \
              getattr(self.cfg, 'trailing_enabled', True) and \
-             trade.max_favorable_pips >= getattr(self.cfg, 'trailing_activation_pips', 50.0):
+             trade.max_favorable_pips >= getattr(self.cfg, 'trailing_activation_pips', 50.0) and \
+             not getattr(self.cfg, 'protect_to_tp2', True):
+            # 🔴 PROTECT_TO_TP2 gate above: trail only when protection is OFF.
             # Trailing stop: trail SL behind the HIGH-WATER MARK (peak pips),
             # NOT current pips. Without this, a pullback from +80 to +60 pips
             # would incorrectly move the SL BACK from entry+60 to entry+40.
@@ -381,6 +383,11 @@ class TradeManager:
         close remaining position. Only active AFTER TP1 partial close —
         before TP1, the 3-stage SL system manages the full position.
         """
+        # 🔴 PROTECT_TO_TP2 — suppress give-back pullback exit entirely.
+        # Remaining 50% (post-TP1) runs to TP2 untouched.
+        if getattr(self.cfg, "protect_to_tp2", True):
+            return None
+
         # Give-back only protects the remaining 50% after TP1 hit.
         # Before TP1: trade is managed by SL stages + trailing only.
         if not trade.tp1_hit:
@@ -426,6 +433,12 @@ class TradeManager:
         """
         exits = []
         for trade_id, trade in list(self.active_trades.items()):
+            # 🔴 PROTECT_TO_TP2 — suppress emergency reversal exit entirely.
+            # Trade should reach TP1/TP2 or be stopped by SL stages, not closed
+            # by transient opposite-direction candles.
+            if getattr(self.cfg, "protect_to_tp2", True):
+                continue
+
             opposite = False
             if trade.direction == TradeDirection.BUY and close_p < open_p:
                 opposite = True

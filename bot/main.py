@@ -340,6 +340,12 @@ class TradingBot:
         if self._last_bar_time and latest_time <= self._last_bar_time:
             # Same bar — update active trades with latest price
             price = float(df["Close"].iloc[-1])
+
+            # 🔁 RECONCILE on every tick — detect stop fills within current bar.
+            # Stop fills server-side within an M15 bar (up to 14.5 min between bars).
+            # Without this, filled trade has no ActiveTrade until next bar close.
+            self._register_pending_fills()
+
             exit_events = self._manage_active_trades(price)
             if exit_events:
                 self.executor.process_exits(exit_events)
@@ -393,15 +399,8 @@ class TradingBot:
         # cancel the pending to keep MT5 Orders tab clean.
         self._expire_pending_stops()
 
-        # 🔁 RECONCILE (runtime) — detect pending stop orders filled by broker.
-        # Broker converts pending → position when C1 breakout price is hit.
-        # Our 30s poll won't see the fill until next tick, but we need to clean
-        # pending_stop_orders so we don't try to cancel an already-filled order.
-        if self.reconciler and self.pending_stop_orders:
-            gone = self.reconciler.check_stop_fills(self.pending_stop_orders)
-            for ticket in gone:
-                del self.pending_stop_orders[ticket]
-                logger.info("🔁 Stop %d cleaned from pending dict (no longer in MT5 orders)", ticket)
+        # 🔁 RECONCILE (runtime) — detect pending stop orders filled/canceled by broker.
+        self._register_pending_fills()
 
         # 🔴 STRUCTURAL INVALIDATION — cancel any pending stop whose C1 wick
         # was breached by the forming C0 bar (or current tick). Must run on
@@ -500,8 +499,10 @@ class TradingBot:
                             "signal": sig,
                             "bars_waiting": 0,
                             "placed_at": datetime.now(timezone.utc),
-                            "expiry_bars": sig.context.get("stop_expiry_bars", 1),
+                            "expiry_bars": sig.context.get("stop_expiry_bars", self.cfg.strategy.pending_expiry_bars),
                             "lot_size": lot_size,
+                            "risk_percent": self.risk_mgr.current_risk_percent,
+                            "balance_before": self.executor.balance,
                         }
                         self.telegram.notify_pending_stop({
                             "ticket": ticket,
@@ -511,7 +512,7 @@ class TradingBot:
                             "tp1_price": sig.tp1_price,
                             "risk_pips": sig.risk_pips,
                             "stop_buffer_pips": sig.context.get("stop_buffer_pips", 2.0),
-                            "expiry_bars": sig.context.get("stop_expiry_bars", 1),
+                            "expiry_bars": sig.context.get("stop_expiry_bars", self.cfg.strategy.pending_expiry_bars),
                             "sr_level": sig.sr_level.price,
                         })
                         logger.info("📲 STOP pending alert sent: ticket=%d", ticket)
@@ -556,14 +557,24 @@ class TradingBot:
         self._check_daily_summary()
 
     def _check_periodic_status(self):
-        """Send hourly Telegram status."""
+        """Send 2-hour Telegram status.
+
+        🔴 Timer is advanced before the send so a failing send doesn't spam.
+        executor.get_status() and the market-context fetch are wrapped in a
+        broad try/except so an MT5 blip doesn't silently swallow the alert
+        and leave a 4-hour gap (timer advanced + exception caught by caller).
+        """
         now = time.time()
         if now - self._last_status_time < self._status_interval:
             return
 
         self._last_status_time = now
 
-        status = self.executor.get_status()
+        try:
+            status = self.executor.get_status()
+        except Exception as e:
+            logger.error("Periodic status: get_status() failed — skipping alert: %s", e)
+            return
 
         # Add live market context
         try:
@@ -750,8 +761,11 @@ class TradingBot:
                 old_sl, old_stage = sl_before[tid]
                 if trade.sl_stage.value != old_stage:
                     # 🔴 LIVE RISK — SL stage changed: push new SL to broker.
-                    sl_ok = self.executor.modify_sl(tid, trade.sl_price)
-                    if sl_ok:
+                    # Returns actual SL set (may be clamped vs target if price
+                    # is near C0 extreme), or None if modify failed completely.
+                    actual_sl = self.executor.modify_sl(tid, trade.sl_price)
+                    if actual_sl is not None:
+                        trade.sl_price = actual_sl  # use actual (clamped if needed)
                         self.telegram.notify_sl_update(
                             tid, old_sl, trade.sl_price, trade.sl_stage.value
                         )
@@ -764,23 +778,21 @@ class TradingBot:
                         except Exception as e:
                             logger.error("Failed to persist SL: %s", e)
                     else:
-                        # 🔴 LIVE RISK — broker rejected SL modification.
-                        # Revert TradeManager to old SL/stage so the next tick
-                        # re-attempts (stage change will be detected again).
-                        # Without this, the stage is already 2 in memory but
-                        # the broker still has Stage 1 SL — ghost mismatch.
+                        # 🔴 LIVE RISK — broker rejected even clamped SL.
+                        # Revert TradeManager so next tick re-attempts.
                         trade.sl_price = old_sl
                         trade.sl_stage = SLStage(old_stage)
                         logger.warning(
-                            "SL stage advance rejected for %s — reverted to "
+                            "SL stage advance failed for %s — reverted to "
                             "stage=%d, sl=%.2f. Will retry next tick.",
                             tid, old_stage, old_sl
                         )
 
                 elif abs(trade.sl_price - old_sl) > 0.001:
                     # Trailing stop moved SL (same stage, different price)
-                    sl_ok = self.executor.modify_sl(tid, trade.sl_price)
-                    if sl_ok:
+                    actual_sl = self.executor.modify_sl(tid, trade.sl_price)
+                    if actual_sl is not None:
+                        trade.sl_price = actual_sl  # use actual (clamped if needed)
                         try:
                             self.db.update_trade(tid, {
                                 "sl_current": trade.sl_price,
@@ -862,12 +874,68 @@ class TradingBot:
         for t in invalidated:
             del self.pending_stop_orders[t]
 
+    def _register_pending_fills(self) -> None:
+        """
+        🔁 RECONCILE (every tick) — detect pending stop orders filled by broker,
+        register them as active trades, and send Telegram alert.
+        Also cleans canceled stops (gone from broker with no matching position).
+        """
+        if not self.reconciler or not self.pending_stop_orders:
+            return
+
+        filled, canceled = self.reconciler.register_filled_stops(
+            self.pending_stop_orders, self.db, self.trade_mgr,
+            self.executor._ticket_map,
+        )
+
+        for trade_id, _position_ticket in filled:
+            # Grab pending data before removing (needed for Telegram alert)
+            pdata = next(
+                (v for v in self.pending_stop_orders.values()
+                 if v["signal"].trade_id == trade_id),
+                None,
+            )
+            # Remove from pending dict
+            for pticket in list(self.pending_stop_orders.keys()):
+                if self.pending_stop_orders[pticket]["signal"].trade_id == trade_id:
+                    del self.pending_stop_orders[pticket]
+                    break
+            # 📲 ALERT — stop order filled, trade is now live
+            active = self.trade_mgr.active_trades.get(trade_id)
+            if active:
+                lot_size = pdata["lot_size"] if pdata else active.lot_size
+                risk_pct = pdata["risk_percent"] if pdata else 0.0
+                bal = pdata["balance_before"] if pdata else self.executor.balance
+                risk_pips = price_to_pips(abs(active.entry_price - active.sl_price))
+                risk_dollars = risk_pips * self.cfg.strategy.pip_value_per_lot * lot_size
+                self.telegram.notify_trade_opened({
+                    "trade_id": trade_id,
+                    "direction": active.direction.value,
+                    "entry_type": "c1_c0_rejection",
+                    "lot_size": lot_size,
+                    "entry_price": active.entry_price,
+                    "sl_price": active.sl_price,
+                    "tp1_price": active.tp1_price,
+                    "tp2_price": active.tp2_price,
+                    "risk_pips": risk_pips,
+                    "risk_dollars": risk_dollars,
+                    "risk_percent": risk_pct,
+                    "balance": bal,
+                    "sr_level": pdata["signal"].sr_level.price if pdata else 0.0,
+                    "sr_touches": pdata["signal"].sr_level.touches if pdata else 0,
+                })
+                logger.info("📲 Trade-opened alert sent for filled stop: %s", trade_id)
+
+        for ticket in canceled:
+            del self.pending_stop_orders[ticket]
+            logger.info("🔁 Stop %d canceled (no position found)", ticket)
+
     def _expire_pending_stops(self) -> None:
         """
         🔴 NEW ENTRY MODEL — Cancel pending stop orders that exceeded expiry window.
 
         Call on new-bar branch (once per M15 bar close), NOT every 30s tick.
-        Each bar increments `bars_waiting`. If > `expiry_bars` (default 1),
+        Each bar increments `bars_waiting`. If >= `expiry_bars` (default 2),
         cancel via MT5 and remove from tracking dict. If cancel fails, keep
         entry so next bar retries.
 
@@ -879,13 +947,13 @@ class TradingBot:
         expired: list[int] = []
         for ticket, info in self.pending_stop_orders.items():
             info["bars_waiting"] += 1
-            if info["bars_waiting"] > info["expiry_bars"]:
+            if info["bars_waiting"] >= info["expiry_bars"]:
                 if self.executor.cancel_stop_order(ticket):
                     expired.append(ticket)
                     sig = info["signal"]
                     logger.info(
                         "Stop order EXPIRED: ticket=%d %s trigger=%.2f "
-                        "(bars_waited=%d > expiry=%d)",
+                        "(bars_waited=%d >= expiry=%d)",
                         ticket, sig.direction.value, sig.entry_price,
                         info["bars_waiting"], info["expiry_bars"]
                     )

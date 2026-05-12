@@ -88,7 +88,10 @@ class StrategyConfig:
     # === PRE-ENTRY FILTERS ===
     min_room_pips: float = 15.0     # $1.5 room to opposing S/R (was $3, too tight)
     min_sr_gap_pips: float = 20.0
-    max_mid_range_pct: float = 0.50  # 50% dead zone (was 35%, too restrictive)
+    max_mid_range_pct: float = 0.30  # 30% dead zone: blocks 35%-65% only.
+                                     # 0.50 killed valid near-S/R London setups at
+                                     # 0.27-0.34 (near support) and 0.66-0.72 (near
+                                     # resistance). ⚠️ ENV: MAX_MID_RANGE_PCT
     min_sl_pips: float = 10.0         # 🔴 LIVE RISK — stop-order model uses C1 wick tip SL (tighter than old C0-market-entry SL).
                                       # 20p floor inherited from C0-market-entry model; was blocking most valid C1 setups silently.
     max_risk_pips: float = 300.0
@@ -114,6 +117,18 @@ class StrategyConfig:
     giveback_close_pct: float = 0.50
     small_body_threshold: float = 0.35
 
+    # === TRADE PROTECTION ===
+    # When True, lock trade to TP1 partial → TP2 full close, OR SL hit, OR session-end.
+    # Suppresses ALL three early-exit paths:
+    #   • check_opposite_close (emergency reversal exit)
+    #   • _check_giveback (pullback-after-peak exit)
+    #   • _update_sl_stage trailing branch (SL ratchet behind peak)
+    # SL stages 1→2→3 still advance (those move SL toward profit, never close).
+    # 🔴 LIVE RISK: setting False reverts to legacy management — strong opposite
+    # candles can close 100% pre-TP1, and post-TP1 trailing/giveback can cut the
+    # remaining 50% short of TP2.
+    protect_to_tp2: bool = True   # ⚠️ ENV: PROTECT_TO_TP2
+
     # === SESSION FILTER (UTC hours) ===
     # London open = 08:00 UTC, NY close = 22:00 UTC
     # Do NOT change session_start below 8 — 06:00 UTC is still Asia session
@@ -129,7 +144,10 @@ class RiskConfig:
     min_lots: float = 0.01
     max_lots: float = 100.0
     consecutive_loss_threshold: int = 2
-    risk_reduction_increment: float = 0.5
+    risk_reduction_increment: float = 0.0   # 🔴 LIVE RISK — 0.0 disables consecutive-loss reduction.
+                                            # Bot uses flat risk_percent always. Daily loss limit (4%)
+                                            # and max-trades-per-day (3) still active. Set 0.5 to
+                                            # re-enable Raja 2/0.5 safety system.
     risk_recovery_increment: float = 0.25
     max_trades_per_day: int = 3
     daily_loss_limit: float = 4.0
@@ -249,10 +267,14 @@ class BotConfig:
         cfg.strategy.trailing_activation_pips = _env_float("TRAILING_ACTIVATION_PIPS", 50.0)
         cfg.strategy.trailing_distance_pips = _env_float("TRAILING_DISTANCE_PIPS", 20.0)
 
+        # Trade protection (lock to TP1 partial → TP2 full, or SL/session-end only)
+        cfg.strategy.protect_to_tp2 = _env_bool("PROTECT_TO_TP2", True)
+
         # Risk
         cfg.risk.risk_percent = _env_float("RISK_PERCENT", 1.0)
         cfg.risk.max_trades_per_day = _env_int("MAX_TRADES_PER_DAY", 3)
         cfg.risk.daily_loss_limit = _env_float("DAILY_LOSS_LIMIT", 4.0)
+        cfg.risk.risk_reduction_increment = _env_float("RISK_REDUCTION_INCREMENT", 0.0)  # 🔴 0.0 = disabled
 
         # Telegram
         cfg.telegram.enabled = _env_bool("TELEGRAM_ENABLED", False)

@@ -160,6 +160,18 @@ class MT5Connector:
         logger.info("  Min lot: %.2f | Step: %.2f | Max lot: %.2f",
                      info.volume_min, info.volume_step, info.volume_max)
 
+        # 🔴 LIVE RISK — Decode broker pending-order expiration capability bitmask.
+        # Bit 1=GTC, 2=DAY, 4=SPECIFIED, 8=SPECIFIED_DAY. ICMarkets typically returns 3
+        # (GTC|DAY only). place_stop_order falls back to GTC when SPECIFIED missing.
+        exp_mode = getattr(info, "expiration_mode", 0) or 0
+        flags = []
+        if exp_mode & 1: flags.append("GTC")
+        if exp_mode & 2: flags.append("DAY")
+        if exp_mode & 4: flags.append("SPECIFIED")
+        if exp_mode & 8: flags.append("SPECIFIED_DAY")
+        logger.info("  Expiration modes: %d [%s]",
+                     exp_mode, ", ".join(flags) if flags else "none")
+
         # 📲 ALERT — startup connection success
         self._alert(
             f"✅ MT5 Connected\n"

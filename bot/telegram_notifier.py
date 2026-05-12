@@ -63,19 +63,26 @@ class TelegramNotifier:
             return loop
 
     async def _send(self, text: str, retries: int = 2):
-        """Send message with retry logic."""
-        if not self._enabled or not self.bot:
+        """Send message with retry logic.
+
+        Creates a fresh Bot context each call — avoids stale httpx connections
+        after long idle periods (e.g. the 2-hour status interval). The stored
+        self.bot instance has an internal httpx.AsyncClient tied to a previous
+        event loop run; reusing it after idle time causes silent send failures.
+        """
+        if not self._enabled or not self.cfg.bot_token:
             return
 
         parse_mode = "HTML"
 
         for attempt in range(retries + 1):
             try:
-                await self.bot.send_message(
-                    chat_id=self.cfg.chat_id,
-                    text=text,
-                    parse_mode=parse_mode,
-                )
+                async with Bot(token=self.cfg.bot_token) as bot:
+                    await bot.send_message(
+                        chat_id=self.cfg.chat_id,
+                        text=text,
+                        parse_mode=parse_mode,
+                    )
                 return
             except Exception as e:
                 if attempt < retries:
@@ -85,15 +92,23 @@ class TelegramNotifier:
                                  retries + 1, e)
 
     def send_sync(self, text: str):
-        """Synchronous send wrapper."""
+        """Synchronous send wrapper.
+
+        Uses asyncio.run() to get a fresh event loop per call. The old pattern
+        (get_event_loop + run_until_complete) reused the same loop across calls,
+        leaving the httpx connection pool in a stale state after 2-hour idle gaps.
+        asyncio.run() creates and cleanly tears down a new loop each time.
+        """
         if not self._enabled:
             return
         try:
-            loop = self._get_loop()
-            if loop.is_running():
+            asyncio.run(self._send(text))
+        except RuntimeError as e:
+            # Rare: send_sync called from inside an already-running event loop.
+            if "already running" in str(e).lower():
                 asyncio.ensure_future(self._send(text))
             else:
-                loop.run_until_complete(self._send(text))
+                logger.error("Telegram sync send error: %s", e)
         except Exception as e:
             logger.error("Telegram sync send error: %s", e)
 
