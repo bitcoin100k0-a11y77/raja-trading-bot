@@ -305,39 +305,30 @@ class TradeManager:
 
     def _update_sl_stage(self, trade: ActiveTrade, favorable_pips: float):
         """
-        Progress SL through Raja's 3 stages.
-        Stage 1 -> Stage 2 at +20 pips (move to C0 extreme)
-        Stage 2 -> Stage 3 at +40 pips (move to breakeven)
-        """
-        if trade.sl_stage == SLStage.STAGE_1 and \
-           favorable_pips >= self.cfg.sl_stage2_pips:
-            # Move to Stage 2: SL at C0 extreme
-            if trade.c0_extreme is not None:
-                old_sl = trade.sl_price
-                trade.sl_price = trade.c0_extreme
-                trade.sl_stage = SLStage.STAGE_2
-                logger.info("SL Stage 2: %s moved SL %.2f -> %.2f (C0 extreme)",
-                             trade.trade_id, old_sl, trade.sl_price)
-            else:
-                # If no C0 extreme stored, use a conservative move
-                buffer = pips_to_price(self.cfg.sl_stage2_pips / 2)
-                old_sl = trade.sl_price
-                if trade.direction == TradeDirection.BUY:
-                    trade.sl_price = max(trade.sl_price, trade.entry_price - buffer)
-                else:
-                    trade.sl_price = min(trade.sl_price, trade.entry_price + buffer)
-                trade.sl_stage = SLStage.STAGE_2
-                logger.info("SL Stage 2: %s moved SL %.2f -> %.2f (conservative)",
-                             trade.trade_id, old_sl, trade.sl_price)
+        Single-jump SL system: STAGE_1 (initial) → STAGE_3 (breakeven) at +30p.
 
-        elif trade.sl_stage == SLStage.STAGE_2 and \
-             favorable_pips >= self.cfg.sl_stage3_pips:
-            # Move to Stage 3: Breakeven
+        Replaces legacy 3-stage ladder (+20 → C0 extreme, +40 → BE). Stage 2
+        path retained as enum value for DB compatibility, but never assigned
+        to new trades. Old DB rows with sl_stage=2 still deserialize and
+        advance to Stage 3 at +sl_breakeven_pips favorable on first tick.
+
+        Trailing stage (post-BE) still gated by protect_to_tp2 — when True,
+        BE is the final SL position and trade runs to TP1/TP2 untouched.
+        """
+        be_trigger = getattr(self.cfg, 'sl_breakeven_pips', 30.0)
+
+        if trade.sl_stage in (SLStage.STAGE_1, SLStage.STAGE_2) and \
+           favorable_pips >= be_trigger:
+            # Direct jump to breakeven from either Stage 1 (new trades)
+            # or Stage 2 (legacy trades restored from DB).
             old_sl = trade.sl_price
+            old_stage = trade.sl_stage.name
             trade.sl_price = trade.entry_price
             trade.sl_stage = SLStage.STAGE_3
-            logger.info("SL Stage 3 (BE): %s moved SL %.2f -> %.2f",
-                         trade.trade_id, old_sl, trade.sl_price)
+            logger.info(
+                "SL → BE (single-jump): %s moved SL %.2f -> %.2f at +%.1fp favorable (was %s)",
+                trade.trade_id, old_sl, trade.sl_price, favorable_pips, old_stage,
+            )
 
         elif trade.sl_stage == SLStage.STAGE_3 and \
              getattr(self.cfg, 'trailing_enabled', True) and \

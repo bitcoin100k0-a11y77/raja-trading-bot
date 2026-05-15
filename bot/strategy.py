@@ -239,6 +239,18 @@ class Strategy:
                 # 🔴 Stop order = C1 high + buffer (break of rejection). SL = C1 low.
                 stop_entry = h + buffer_price
                 stop_sl    = l
+                # 🔴 LIVE RISK — midpoint cap: bound risk on large rejection candles.
+                # When c1_range > sl_midpoint_cap_pips, replace full-wick SL with
+                # candle midpoint so risk_pips ≈ range/2 + buffer. Position sizing
+                # (utils.calculate_lot_size) auto-scales: tighter SL → larger lots
+                # at the same 1% risk. TP recalculates against the new risk_pips.
+                if c1_range_pips > self.cfg.sl_midpoint_cap_pips:
+                    midpoint = (h + l) / 2.0
+                    logger.info(
+                        "SL midpoint cap (BUY): c1_range=%.1fp > %.1fp — SL %.2f -> %.2f (mid of %.2f/%.2f)",
+                        c1_range_pips, self.cfg.sl_midpoint_cap_pips, stop_sl, midpoint, h, l,
+                    )
+                    stop_sl = midpoint
                 risk_pips  = price_to_pips(stop_entry - stop_sl)
                 tp1, tp2 = self._calculate_tp(TradeDirection.BUY, stop_entry,
                                               risk_pips, market)
@@ -300,6 +312,15 @@ class Strategy:
                 # 🔴 Stop order = C1 low - buffer (break of rejection). SL = C1 high.
                 stop_entry = l - buffer_price
                 stop_sl    = h
+                # 🔴 LIVE RISK — midpoint cap: same logic as BUY block above.
+                # Large C1 → SL = midpoint, smaller risk_pips, larger position size.
+                if c1_range_pips > self.cfg.sl_midpoint_cap_pips:
+                    midpoint = (h + l) / 2.0
+                    logger.info(
+                        "SL midpoint cap (SELL): c1_range=%.1fp > %.1fp — SL %.2f -> %.2f (mid of %.2f/%.2f)",
+                        c1_range_pips, self.cfg.sl_midpoint_cap_pips, stop_sl, midpoint, h, l,
+                    )
+                    stop_sl = midpoint
                 risk_pips  = price_to_pips(stop_sl - stop_entry)
                 tp1, tp2 = self._calculate_tp(TradeDirection.SELL, stop_entry,
                                               risk_pips, market)

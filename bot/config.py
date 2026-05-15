@@ -97,7 +97,23 @@ class StrategyConfig:
     max_risk_pips: float = 300.0
     max_spread_pips: float = 10.0
 
-    # === STOP LOSS STAGES ===
+    # === STOP LOSS RULES ===
+    # 🔴 LIVE RISK — Initial SL at C1 wick tip (BUY=c1_low, SELL=c1_high).
+    # When C1 candle range exceeds sl_midpoint_cap_pips, cap SL to the candle
+    # midpoint. Bounds risk_pips at ~range/2, lets sizing produce larger lots
+    # at the same 1% account risk on high-volatility setups.
+    sl_midpoint_cap_pips: float = 50.0   # ⚠️ ENV: SL_MIDPOINT_CAP_PIPS
+
+    # Favorable distance that triggers SL → breakeven jump (single-jump model).
+    # Replaces the legacy 3-stage ladder (+20 → C0, +40 → BE). After BE,
+    # trade runs to TP1/TP2/BE-stop with no further SL movement (unless
+    # protect_to_tp2=False which re-enables trailing).
+    sl_breakeven_pips: float = 30.0      # ⚠️ ENV: SL_BREAKEVEN_PIPS
+
+    # DEPRECATED — kept for backward compat with old code paths and
+    # legacy DB rows (sl_stage column accepts 1/2/3). STAGE_2 is now
+    # unreachable for new trades; old trades restored from DB with
+    # sl_stage=2 still deserialize and advance to STAGE_3 at +30p.
     sl_stage2_pips: float = 20.0
     sl_stage3_pips: float = 40.0
 
@@ -245,6 +261,8 @@ class BotConfig:
         # SL / TP params
         cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 10.0)
         cfg.strategy.min_tp1_pips = _env_float("MIN_TP1_PIPS", 30.0)
+        cfg.strategy.sl_midpoint_cap_pips = _env_float("SL_MIDPOINT_CAP_PIPS", 50.0)
+        cfg.strategy.sl_breakeven_pips    = _env_float("SL_BREAKEVEN_PIPS", 30.0)
 
         # Entry params
         cfg.strategy.rejection_tolerance = _env_float("REJECTION_TOLERANCE", 8.0)
