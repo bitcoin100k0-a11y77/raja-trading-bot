@@ -25,7 +25,7 @@ from mt5_connector import MT5Connector
 from market_analyzer import MarketAnalyzer
 from strategy import Strategy
 from risk_manager import RiskManager
-from trade_manager import TradeManager
+from trade_manager import TradeManager, reconcile_close_price
 from mt5_executor import MT5Executor
 from broker_reconciler import BrokerReconciler, ReconcileReport
 from learning_agent import LearningAgent
@@ -600,10 +600,9 @@ class TradingBot:
                 open_trade_details = []
                 unrealized_pnl_total = 0.0
                 for tid, trade in self.trade_mgr.active_trades.items():
-                    if trade.direction == TradeDirection.BUY:
-                        pnl_pips = price_to_pips(current_price - trade.entry_price)
-                    else:
-                        pnl_pips = price_to_pips(trade.entry_price - current_price)
+                    # SIGNED PnL — an underwater open trade must show negative
+                    # pips, not a positive abs() distance.
+                    pnl_pips = self.trade_mgr._calc_pnl_pips(trade, current_price)
                     pnl_dollars = pnl_pips * self.cfg.strategy.pip_value_per_lot * trade.remaining_lots
                     unrealized_pnl_total += pnl_dollars
                     open_trade_details.append({
@@ -665,17 +664,33 @@ class TradingBot:
                     trade_id, ticket
                 )
                 # Try to get actual close price from deal history
-                actual_exit = self.executor._get_deal_close_price(ticket)
-                if actual_exit is None:
-                    # Fallback: use current price
-                    actual_exit = float(
-                        self.data.get_current_price() or trade.sl_price
+                raw_exit = self.executor._get_deal_close_price(ticket)
+
+                # 🔴 LIVE RISK — validate the broker close price against THIS
+                # trade's own SL/TP levels. A price far outside that band is a
+                # wrong/stale position ticket in the deal lookup (or a stale
+                # current-price fallback) — snapping prevents a fabricated
+                # win/loss, e.g. a breakeven close mis-reported as a −251-pip
+                # loss because the lookup returned an unrelated price.
+                actual_exit, exit_trusted = reconcile_close_price(
+                    raw_exit,
+                    trade.sl_price, trade.tp1_price, trade.tp2_price,
+                    default_price=trade.sl_price,
+                )
+                if not exit_trusted:
+                    logger.warning(
+                        "⚠️ Broker close price for %s UNRELIABLE — raw=%s snapped=%.2f "
+                        "| entry=%.2f sl=%.2f tp1=%.2f tp2=%.2f tp1_hit=%s "
+                        "remaining_lots=%.2f sl_stage=%s ticket=%d",
+                        trade_id, raw_exit, actual_exit, trade.entry_price,
+                        trade.sl_price, trade.tp1_price, trade.tp2_price,
+                        trade.tp1_hit, trade.remaining_lots,
+                        trade.sl_stage.value, ticket,
                     )
 
-                if trade.direction.value == "BUY":
-                    pnl_pips = price_to_pips(actual_exit - trade.entry_price)
-                else:
-                    pnl_pips = price_to_pips(trade.entry_price - actual_exit)
+                # SIGNED PnL so a broker-side LOSS is not reported as +pips.
+                # (abs() distance previously made every broker close look like a win.)
+                pnl_pips = self.trade_mgr._calc_pnl_pips(trade, actual_exit)
 
                 # 🔴 LIVE RISK — Determine close reason from actual SL stage + exit price.
                 # Old code hardcoded SL_STAGE1 regardless of what happened.

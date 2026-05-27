@@ -13,6 +13,43 @@ from utils import price_to_pips, pips_to_price
 logger = logging.getLogger(__name__)
 
 
+def reconcile_close_price(
+    raw_exit: Optional[float],
+    sl_price: float,
+    tp1_price: float,
+    tp2_price: float,
+    default_price: float,
+    tol_pips: float = 30.0,
+) -> tuple:
+    """
+    🔴 LIVE RISK — Validate a broker-reported close price against a trade's own
+    SL/TP levels and return (exit_price, trustworthy).
+
+    A legitimate SL/TP/breakeven close lands within a few pips of one of the
+    trade's known exit levels. A price far outside that band is NOT a real close
+    for this trade — it signals a wrong/stale position ticket in the deal lookup
+    or a current-price fallback. In that case we snap to the nearest known level
+    so PnL is not fabricated (e.g. a breakeven close mis-reported as a −251-pip
+    loss because the deal lookup returned an unrelated price).
+
+    When the raw price is within tolerance it is returned unchanged so genuine
+    slippage is preserved. trustworthy=False means the caller should log and
+    treat the trade record as needing review.
+    """
+    levels = [lvl for lvl in (sl_price, tp1_price, tp2_price) if lvl and lvl > 0]
+    if raw_exit is not None and raw_exit > 0:
+        if not levels:
+            return float(raw_exit), True  # nothing to validate against
+        nearest = min(levels, key=lambda lvl: abs(lvl - raw_exit))
+        if abs(nearest - raw_exit) <= pips_to_price(tol_pips):
+            return float(raw_exit), True
+        return float(nearest), False
+    # No usable broker price → fall back to the SL/TP level the trade closed at.
+    if default_price and default_price > 0:
+        return float(default_price), False
+    return float(sl_price), False
+
+
 @dataclass
 class ActiveTrade:
     """In-memory representation of an active trade."""

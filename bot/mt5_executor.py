@@ -22,7 +22,7 @@ except ImportError:
 from config import BotConfig
 from constants import TradeDirection, SLStage, ExitReason, EntryType
 from strategy import Signal
-from trade_manager import TradeManager, ActiveTrade
+from trade_manager import TradeManager, ActiveTrade, reconcile_close_price
 from risk_manager import RiskManager
 from database import TradingDatabase
 from utils import price_to_pips, pips_to_price, get_session, get_4h_candle_number, utc_now
@@ -50,6 +50,44 @@ TRADE_RETCODE_NO_MONEY = 10019
 
 MAX_ORDER_RETRIES = 3
 REQUOTE_DELAY = 0.5  # seconds between retries
+
+
+def clamp_sl_to_valid(
+    is_buy: bool,
+    target_sl: float,
+    current_sl: float,
+    ask: float,
+    bid: float,
+    min_distance: float,
+    digits: int = 2,
+) -> Optional[float]:
+    """
+    🔴 LIVE RISK — Clamp a desired SL to a broker-valid, never-looser level.
+
+    A stop closes the position against the OPPOSITE quote, so validity is about
+    the correct side of the *triggering* price, not raw distance from mid:
+      BUY  position closes at the Bid → SL must sit BELOW bid by >= min_distance.
+      SELL position closes at the Ask → SL must sit ABOVE ask by >= min_distance.
+
+    Returns the SL to send (clamped into the valid band and rounded), or None
+    when no valid level exists that is ALSO tighter than the current SL. None
+    means "can't improve right now" — never loosen protection, never spam the
+    broker with a level it will reject (the INVALID_STOPS revert loop).
+    """
+    eps = (10.0 ** (-digits)) / 2.0
+    if is_buy:
+        # SL must be below bid by min_distance; tighter = higher.
+        max_valid = bid - min_distance
+        candidate = round(min(target_sl, max_valid), digits)
+        if candidate <= current_sl + eps:      # not strictly tighter than now
+            return None
+        return candidate
+    # SELL: SL must be above ask by min_distance; tighter = lower.
+    min_valid = ask + min_distance
+    candidate = round(max(target_sl, min_valid), digits)
+    if candidate >= current_sl - eps:           # not strictly tighter than now
+        return None
+    return candidate
 
 
 class MT5Executor:
@@ -857,71 +895,88 @@ class MT5Executor:
 
         pos = positions[0]
 
-        # 🔴 LIVE RISK — Validate minimum stop distance before sending.
-        # ICMarkets reports trade_stops_level=0 (dynamic minimum) for XAUUSD.
-        # When 0, fall back to spread×3 + 5-pip buffer so we skip rather than
-        # send an order the broker will reject with "Invalid stops".
+        # 🔴 LIVE RISK — Clamp the requested SL to a broker-valid, never-looser
+        # level using a FRESH tick. The old logic measured distance from a
+        # single (possibly stale) pos.price_current and only nudged the SL when
+        # it was too CLOSE; it could not fix a target that landed on the wrong
+        # side of the live Ask/Bid, so a valid breakeven move was rejected with
+        # INVALID_STOPS every tick and the stop never advanced past Stage 1.
         info = mt5.symbol_info(self.cfg.mt5.symbol)
-        if info is not None:
-            if info.trade_stops_level > 0:
-                min_distance = info.trade_stops_level * info.point
-            else:
-                # Dynamic minimum: spread * 3 in price units, minimum 5 pips ($0.50)
-                spread_price = info.spread * info.point
-                min_distance = max(spread_price * 3.0, pips_to_price(5.0))
-
-            current_price = pos.price_current
-            sl_distance = abs(current_price - new_sl)
-            if sl_distance < min_distance:
-                # 🔴 LIVE RISK — target SL is within broker minimum distance.
-                # Auto-clamp to just outside minimum so the stage still advances.
-                # This happens when a profitable trade's price hovers near the
-                # C0 extreme (Stage 2 target). Clamping avoids the infinite
-                # 30-second retry loop while still tightening the SL from Stage 1.
-                original_target = new_sl
-                clamp_dist = min_distance * 1.2  # 20% buffer over broker minimum
-                is_buy = (pos.type == getattr(mt5, "POSITION_TYPE_BUY", 0))
-                if is_buy:
-                    new_sl = round(current_price - clamp_dist, self.mt5_conn._digits)
-                else:
-                    new_sl = round(current_price + clamp_dist, self.mt5_conn._digits)
-                logger.info(
-                    "SL clamped to broker min: target=%.2f → clamped=%.2f "
-                    "(dist=%.2f < min=%.2f, price=%.2f, %s)",
-                    original_target, new_sl, sl_distance, min_distance,
-                    current_price, "BUY" if is_buy else "SELL",
-                )
-
-        request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": self.cfg.mt5.symbol,
-            "position": ticket,
-            "sl": round(new_sl, self.mt5_conn._digits),
-            "tp": pos.tp,  # Keep existing TP
-        }
-
-        logger.info("Modifying SL: ticket=%d, old=%.2f -> new=%.2f",
-                    ticket, pos.sl, new_sl)
-
-        result = mt5.order_send(request)
-        if result is None or result.retcode != TRADE_RETCODE_DONE:
-            retcode = result.retcode if result else -1
-            error = result.comment if result else str(mt5.last_error())
-            if retcode == TRADE_RETCODE_INVALID_STOPS:
-                logger.warning(
-                    "SL modify INVALID_STOPS: ticket=%d, new_sl=%.2f "
-                    "— broker rejected even clamped SL. Caller will revert.",
-                    ticket, new_sl
-                )
-            else:
-                logger.error(
-                    "SL modify FAILED: ticket=%d, retcode=%d, error=%s",
-                    ticket, retcode, error
-                )
+        if info is None:
+            logger.warning("SL modify: no symbol_info for %s (ticket=%d)",
+                           self.cfg.mt5.symbol, ticket)
             return None
 
-        logger.info("SL modified OK: ticket=%d -> %.2f", ticket, new_sl)
-        return new_sl
+        if info.trade_stops_level > 0:
+            min_distance = info.trade_stops_level * info.point
+        else:
+            # ICMarkets reports trade_stops_level=0 (dynamic minimum) for XAUUSD.
+            # Fall back to spread×3, floor 5 pips ($0.50).
+            spread_price = info.spread * info.point
+            min_distance = max(spread_price * 3.0, pips_to_price(5.0))
+
+        is_buy = (pos.type == getattr(mt5, "POSITION_TYPE_BUY", 0))
+        target_sl = new_sl
+        digits = self.mt5_conn._digits
+
+        def _attempt(min_dist: float) -> Optional[float]:
+            # Re-read the tick each attempt so the clamp uses live Ask/Bid.
+            tk = mt5.symbol_info_tick(self.cfg.mt5.symbol)
+            if tk is None:
+                logger.warning("SL modify: no tick for %s (ticket=%d)",
+                               self.cfg.mt5.symbol, ticket)
+                return None
+            sl = clamp_sl_to_valid(is_buy, target_sl, pos.sl,
+                                   tk.ask, tk.bid, min_dist, digits)
+            if sl is None:
+                logger.info(
+                    "SL modify skipped: no broker-valid SL tighter than current "
+                    "%.2f (target=%.2f, ask=%.2f, bid=%.2f, min_dist=%.2f, %s)",
+                    pos.sl, target_sl, tk.ask, tk.bid, min_dist,
+                    "BUY" if is_buy else "SELL",
+                )
+                return None
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": self.cfg.mt5.symbol,
+                "position": ticket,
+                "sl": sl,
+                "tp": pos.tp,  # Keep existing TP
+            }
+            logger.info(
+                "Modifying SL: ticket=%d, old=%.2f -> new=%.2f "
+                "(target=%.2f, ask=%.2f, bid=%.2f, min_dist=%.2f)",
+                ticket, pos.sl, sl, target_sl, tk.ask, tk.bid, min_dist,
+            )
+            res = mt5.order_send(request)
+            if res is not None and res.retcode == TRADE_RETCODE_DONE:
+                logger.info("SL modified OK: ticket=%d -> %.2f", ticket, sl)
+                return sl
+            rc = res.retcode if res else -1
+            err = res.comment if res else str(mt5.last_error())
+            if rc == TRADE_RETCODE_INVALID_STOPS:
+                logger.warning(
+                    "SL modify INVALID_STOPS: ticket=%d sl=%.2f (min_dist=%.2f) "
+                    "— retrying wider", ticket, sl, min_dist,
+                )
+            else:
+                logger.error("SL modify FAILED: ticket=%d retcode=%d error=%s",
+                             ticket, rc, err)
+            return None
+
+        # Attempt at broker minimum; on rejection retry once with a wider buffer
+        # (covers brokers whose effective minimum exceeds the reported value,
+        # e.g. spread blowout during news).
+        result_sl = _attempt(min_distance)
+        if result_sl is None:
+            result_sl = _attempt(min_distance * 1.5)
+        if result_sl is None:
+            logger.warning(
+                "SL modify could not place a valid tighter SL for %s "
+                "(target=%.2f, current=%.2f). Caller will revert/retry next tick.",
+                trade_id, target_sl, pos.sl,
+            )
+        return result_sl
 
     def modify_tp(self, trade_id: str, new_tp: float) -> bool:
         """Modify take profit on an existing MT5 position (for TP2 after TP1)."""
@@ -1103,10 +1158,26 @@ class MT5Executor:
                 if not positions:
                     # Broker already closed it (SL/TP hit server-side)
                     logger.info("Position %d already closed by broker", ticket)
-                    # Get actual close price from deal history
-                    actual_price = self._get_deal_close_price(ticket)
-                    if actual_price:
-                        exit_price = actual_price
+                    # Get actual close price from deal history, then validate it
+                    # against the trade's own SL/TP levels so a wrong/stale deal
+                    # lookup cannot overwrite a clean exit with a fabricated
+                    # price (the breakeven-reported-as-loss bug).
+                    raw_close = self._get_deal_close_price(ticket)
+                    validated, trusted = reconcile_close_price(
+                        raw_close,
+                        trade.get("sl_current") or trade.get("sl_initial") or exit_price,
+                        trade.get("tp1_price") or 0.0,
+                        trade.get("tp2_price") or 0.0,
+                        default_price=exit_price,
+                    )
+                    if validated and validated > 0:
+                        exit_price = validated
+                    if not trusted and raw_close is not None:
+                        logger.warning(
+                            "Close price for %s snapped to %.2f (raw=%s) — "
+                            "deal lookup inconsistent with SL/TP levels",
+                            trade_id, exit_price, raw_close,
+                        )
                 elif full_close:
                     # We need to close it ourselves (giveback, session end, etc.)
                     self.close_position(trade_id,
