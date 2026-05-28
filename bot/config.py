@@ -166,6 +166,9 @@ class RiskConfig:
                                             # re-enable Raja 2/0.5 safety system.
     risk_recovery_increment: float = 0.25
     max_trades_per_day: int = 3
+    max_concurrent_trades: int = 1   # 🔴 LIVE RISK — one trade at a time. Blocks
+                                     # duplicate/same-zone entries (a position OR a
+                                     # live pending stop counts against this).
     daily_loss_limit: float = 4.0
     cooldown_bars: int = 4
     second_chance_risk_pct: float = 1.2
@@ -291,6 +294,7 @@ class BotConfig:
         # Risk
         cfg.risk.risk_percent = _env_float("RISK_PERCENT", 1.0)
         cfg.risk.max_trades_per_day = _env_int("MAX_TRADES_PER_DAY", 3)
+        cfg.risk.max_concurrent_trades = _env_int("MAX_CONCURRENT_TRADES", 1)
         cfg.risk.daily_loss_limit = _env_float("DAILY_LOSS_LIMIT", 4.0)
         cfg.risk.risk_reduction_increment = _env_float("RISK_REDUCTION_INCREMENT", 0.0)  # 🔴 0.0 = disabled
 

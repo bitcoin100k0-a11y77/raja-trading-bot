@@ -311,6 +311,29 @@ class TradingBot:
             "volatility_pips": market.volatility_pips,
         })
 
+    def _entries_allowed(self) -> tuple:
+        """
+        🔴 ENTRY GATE — returns (allowed: bool, reason: str). Enforces ONE trade
+        at a time plus the risk circuit-breaker (max trades/day, daily loss,
+        post-loss cooldown, min balance — all via risk_mgr.can_trade).
+
+        A live pending stop counts the same as an open position: it already
+        represents the one intended entry, so the bot never stacks a second stop
+        while one is working. This is the duplicate-entry fix — two BUY_STOPs at
+        the same C1 zone both filling is no longer possible.
+        """
+        allowed, reason = self.risk_mgr.can_trade(self.executor.balance)
+        if not allowed:
+            return False, f"circuit-breaker: {reason}"
+        limit = getattr(self.cfg.risk, "max_concurrent_trades", 1)
+        active = self.trade_mgr.get_active_trade_count()
+        if active >= limit:
+            return False, f"position open ({active}/{limit})"
+        pending = len(self.pending_stop_orders)
+        if pending >= limit:
+            return False, f"pending stop working ({pending}/{limit})"
+        return True, "OK"
+
     def _tick(self):
         """Single iteration of the main loop."""
 
@@ -456,6 +479,16 @@ class TradingBot:
 
             # 6. Filter through learning agent
             for sig in signals:
+                # 🔴 ENTRY GATE — re-checked every signal so the limit holds
+                # WITHIN a bar too. generate_signals can return multiple signals;
+                # without this the loop placed a pending for each (two stops at
+                # the same C1 zone → both filled = the duplicate-entry bug).
+                allowed, gate_reason = self._entries_allowed()
+                if not allowed:
+                    logger.info("⛔ Entry gated: %s — %d signal(s) not placed this bar",
+                                gate_reason, len(signals))
+                    break
+
                 trade_ctx = {
                     "entry_type": sig.entry_type.value,
                     "session_type": market.session.value,
