@@ -305,6 +305,20 @@ class MarketAnalyzer:
                         strength=strength,
                     ))
 
+        # Fallback: if NO support zone formed below price (e.g. after a sharp
+        # decline all body-pivot congestion is overhead → 0 support → bot can
+        # only sell), mark the nearest recent SWING LOW below price as support so
+        # BUY setups can still form at a real structural level. Only when support
+        # is otherwise empty — never overrides or competes with real zones.
+        if not support:
+            syn = self._synthetic_swing_low_support(recent, current_price)
+            if syn is not None:
+                support.append(syn)
+                logger.info(
+                    "Synthetic swing-low support added at %.2f (no pivot support "
+                    "below price %.2f)", syn.price, current_price,
+                )
+
         support.sort(key=lambda x: x.price, reverse=True)   # Nearest first
         resistance.sort(key=lambda x: x.price)               # Nearest first
 
@@ -380,6 +394,36 @@ class MarketAnalyzer:
                 numpp += 20
 
         return hi, lo, numpp
+
+    def _synthetic_swing_low_support(self, recent: pd.DataFrame,
+                                     current_price: float) -> Optional[SRLevel]:
+        """
+        Fallback support = nearest recent SWING LOW below current price.
+
+        Used ONLY when zone detection finds no support below price (after a sharp
+        decline all body-pivot congestion is overhead → 0 support → bot can only
+        sell). Marks the nearest structural swing low so BUY setups can form.
+
+        Returns None when no swing low sits below price (e.g. price at a fresh low
+        with no confirmed swing yet) — we never invent a level out of thin air.
+        The existing C0 distance gate (50 pips) still decides if it is tradeable.
+        """
+        if recent is None or len(recent) < 11 or current_price <= 0:
+            return None
+        lows = recent["Low"].values
+        win = max(3, getattr(self.cfg, "swing_lookback", 10) // 2)
+        swing_idx = detect_swing_lows(lows, window=win)
+        candidates = [float(lows[i]) for i in swing_idx if float(lows[i]) < current_price]
+        if not candidates:
+            return None
+        level = max(candidates)  # nearest support = highest swing low below price
+        return SRLevel(
+            price=level,
+            zone_type=ZoneType.SUPPORT,
+            touches=1,
+            htf_aligned=False,
+            strength=float(self.cfg.sr_min_strength * 20),  # baseline; passes downstream gates
+        )
 
     def _get_htf_levels(self, htf_df: pd.DataFrame) -> List[float]:
         """Extract key levels from higher timeframe data."""
