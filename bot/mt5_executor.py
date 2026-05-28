@@ -90,6 +90,27 @@ def clamp_sl_to_valid(
     return candidate
 
 
+def trade_total_pips(
+    total_pnl_dollars: float,
+    pip_value_per_lot: float,
+    original_lots: float,
+    fallback_pips: float,
+) -> float:
+    """
+    Blended pips for a WHOLE trade, derived from total realised dollars over the
+    ORIGINAL position size.
+
+    With a TP1 partial, the final leg often closes at breakeven (0 pips) while
+    TP1 already banked profit (held in _partial_pnl). Reporting only the final
+    leg produced a misleading "0 pips / R:R 0.00" next to a positive dollar PnL.
+    Deriving pips from the summed dollars keeps pips, $ and R:R consistent.
+    Falls back to the leg pips when sizing data is missing (e.g. paper edge).
+    """
+    if pip_value_per_lot > 0 and original_lots and original_lots > 0:
+        return total_pnl_dollars / (pip_value_per_lot * original_lots)
+    return fallback_pips
+
+
 class MT5Executor:
     """
     Live MT5 order execution engine.
@@ -1227,13 +1248,25 @@ class MT5Executor:
         if full_close:
             total_pnl_dollars = pnl_dollars + self._partial_pnl.pop(trade_id, 0.0)
 
+            # Report the WHOLE trade, not just this final leg. TP1 profit lives
+            # in _partial_pnl; the remainder may close at breakeven (0 pips). Use
+            # blended pips/RR over the ORIGINAL lot size so pips, $ and R:R agree
+            # (fixes "0 pips / R:R 0.00 / $+51.80").
+            orig_lots = trade.get("lot_size") or lots_closed
+            total_pnl_pips = trade_total_pips(
+                total_pnl_dollars, self.cfg.strategy.pip_value_per_lot,
+                orig_lots, pnl_pips,
+            )
+            total_rr = (total_pnl_pips / trade["risk_pips"]
+                        if trade.get("risk_pips", 0) and trade["risk_pips"] > 0 else 0.0)
+
             self.db.close_trade(
                 trade_id=trade_id,
                 exit_price=exit_price,
                 exit_reason=reason.value if isinstance(reason, ExitReason) else reason,
-                pnl_pips=pnl_pips,
+                pnl_pips=total_pnl_pips,
                 pnl_dollars=total_pnl_dollars,
-                rr_achieved=rr,
+                rr_achieved=total_rr,
                 balance_after=self.balance,
             )
 
@@ -1243,7 +1276,7 @@ class MT5Executor:
             logger.info(
                 "TRADE CLOSED: %s | %s | PnL: %.1f pips ($%.2f) | RR: %.2f | Balance: $%.2f",
                 trade_id, reason.value if isinstance(reason, ExitReason) else reason,
-                pnl_pips, total_pnl_dollars, rr, self.balance
+                total_pnl_pips, total_pnl_dollars, total_rr, self.balance
             )
             # NOTE: Telegram notification for trade close is sent by main.py
             # via telegram.notify_trade_closed() after process_exits() returns.
