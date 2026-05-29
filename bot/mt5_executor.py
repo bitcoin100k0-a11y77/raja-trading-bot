@@ -1246,12 +1246,25 @@ class MT5Executor:
             self.balance += pnl_dollars  # Shadow mode: track locally
 
         if full_close:
-            total_pnl_dollars = pnl_dollars + self._partial_pnl.pop(trade_id, 0.0)
+            computed_total = pnl_dollars + self._partial_pnl.pop(trade_id, 0.0)
 
-            # Report the WHOLE trade, not just this final leg. TP1 profit lives
-            # in _partial_pnl; the remainder may close at breakeven (0 pips). Use
-            # blended pips/RR over the ORIGINAL lot size so pips, $ and R:R agree
-            # (fixes "0 pips / R:R 0.00 / $+51.80").
+            # 🔴 MT5 TRUTH — prefer the broker's ACTUAL realized P/L (sum of the
+            # position's OUT deals: profit+commission+swap) over the price-model
+            # estimate. The price model drifts from MT5 (real fills, commission,
+            # swap) and the close-price reconcile can snap to BE when the real
+            # close was in profit — under-reporting the trade (e.g. bot $58 vs
+            # MT5 $75.50). Live: use MT5 realized + actual final close price.
+            # Fall back to the computed total when deals are unavailable (shadow).
+            ticket = self._ticket_map.get(trade_id)
+            total_pnl_dollars = computed_total
+            if self.cfg.live_mode and ticket:
+                realized, mt5_exit = self._get_position_realized(ticket)
+                if realized is not None:
+                    total_pnl_dollars = realized
+                    if mt5_exit:
+                        exit_price = mt5_exit  # actual final close (not snapped/target)
+
+            # Blended pips/RR over the ORIGINAL lot size so pips, $ and R:R agree.
             orig_lots = trade.get("lot_size") or lots_closed
             total_pnl_pips = trade_total_pips(
                 total_pnl_dollars, self.cfg.strategy.pip_value_per_lot,
@@ -1289,11 +1302,41 @@ class MT5Executor:
             self._partial_pnl[trade_id] = self._partial_pnl.get(trade_id, 0.0) + pnl_dollars
             self.db.update_trade(trade_id, {
                 "partial_close_pct": event.get("partial_close_pct", 0.5),
+                "tp1_hit": 1,   # persist so a restart after TP1 doesn't re-fire a 2nd partial
             })
             logger.info(
                 "PARTIAL CLOSE: %s | TP1 | %.2f lots | PnL: +%.1f pips ($%.2f)",
                 trade_id, lots_closed, pnl_pips, pnl_dollars
             )
+
+    def _get_position_realized(self, ticket: int):
+        """
+        🔴 MT5 TRUTH — realized P/L for a closed position from deal history.
+
+        Returns (total_dollars, final_exit_price), summing profit+commission+swap
+        across the position's OUT deals (entry==1), or (None, None) if no deals.
+        This is the broker's ACTUAL realized P/L in account currency — accounts
+        for real fills, partial closes, commission and swap — so the report can
+        equal the MT5 terminal. Price-model PnL only approximates it.
+        """
+        try:
+            from datetime import timedelta
+            now = datetime.now(timezone.utc)
+            deals = mt5.history_deals_get(now - timedelta(days=7), now,
+                                          position=ticket)
+            if not deals:
+                return None, None
+            out = [d for d in deals if getattr(d, "entry", 0) == 1]  # DEAL_ENTRY_OUT
+            if not out:
+                return None, None
+            total = sum(float(d.profit) + float(d.commission) + float(d.swap)
+                        for d in out)
+            final_price = float(out[-1].price)  # last OUT deal = final remainder close
+            return round(total, 2), final_price
+        except Exception as e:
+            logger.warning("Could not read MT5 realized P/L for ticket %d: %s",
+                           ticket, e)
+            return None, None
 
     def _get_deal_close_price(self, ticket: int) -> Optional[float]:
         """Get actual close price from MT5 deal history."""

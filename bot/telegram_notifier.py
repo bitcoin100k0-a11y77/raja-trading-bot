@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from config import TelegramConfig
+from utils import price_to_pips
 
 logger = logging.getLogger(__name__)
 
@@ -240,20 +241,49 @@ class TelegramNotifier:
         reason_key = exit_reason.upper() if isinstance(exit_reason, str) else "?"
         reason_text = reason_labels.get(reason_key, exit_reason)
 
-        text = (
-            f"{emoji} <b>TRADE CLOSED</b>\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"ID: <code>{trade_info.get('trade_id', '?')}</code>\n"
-            f"Direction: {trade_info.get('direction', '?')}\n"
-            f"Entry: ${trade_info.get('entry_price', 0):.2f}\n"
-            f"Exit: ${trade_info.get('exit_price', 0):.2f}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"Reason: {reason_text}\n"
-            f"PnL: {trade_info.get('pnl_pips', 0):.0f} pips (${pnl:+,.2f})\n"
-            f"R:R Achieved: {rr:.2f}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"Balance: ${trade_info.get('balance_after', 0):,.2f}"
-        )
+        entry = trade_info.get("entry_price", 0) or 0
+        exit_px = trade_info.get("exit_price", 0) or 0
+        net_pips = trade_info.get("pnl_pips", 0)
+        partial = trade_info.get("partial_close_pct", 0) or 0
+        tp1 = trade_info.get("tp1_price", 0) or 0
+
+        if partial > 0 and tp1 > 0 and entry > 0:
+            # TP1 + remainder: show BOTH legs so the net reconciles. The single
+            # block conflated the breakeven remainder (entry==exit) with the
+            # whole-trade blended PnL → looked like "SL Hit" on a winner with
+            # entry==exit yet +pips. PnL/$ here are MT5-actual (set on close).
+            tp1_pips = price_to_pips(abs(tp1 - entry))
+            pct = int(round(partial * 100))
+            text = (
+                f"{emoji} <b>TRADE CLOSED — TP1 + Remainder</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"ID: <code>{trade_info.get('trade_id', '?')}</code>\n"
+                f"Direction: {trade_info.get('direction', '?')}\n"
+                f"Entry: ${entry:.2f}\n"
+                f"TP1: ${tp1:.2f}  (+{tp1_pips:.0f}p · {pct}% closed)\n"
+                f"Remainder exit: ${exit_px:.2f}  ({reason_text})\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Net PnL: {net_pips:+.0f} pips (${pnl:+,.2f})\n"
+                f"R:R Achieved: {rr:+.2f}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Balance: ${trade_info.get('balance_after', 0):,.2f}"
+            )
+        else:
+            # Single-leg close (no TP1 partial) — original format.
+            text = (
+                f"{emoji} <b>TRADE CLOSED</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"ID: <code>{trade_info.get('trade_id', '?')}</code>\n"
+                f"Direction: {trade_info.get('direction', '?')}\n"
+                f"Entry: ${entry:.2f}\n"
+                f"Exit: ${exit_px:.2f}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Reason: {reason_text}\n"
+                f"PnL: {net_pips:.0f} pips (${pnl:+,.2f})\n"
+                f"R:R Achieved: {rr:.2f}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Balance: ${trade_info.get('balance_after', 0):,.2f}"
+            )
         self.send_sync(text)
 
     def notify_sl_update(self, trade_id: str, old_sl: float,
