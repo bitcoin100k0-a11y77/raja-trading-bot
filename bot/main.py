@@ -205,12 +205,46 @@ class TradingBot:
         # === PRELOAD MARKET DATA ===
         self._preload_market_data()
 
+        # 🔴 REAL-MONEY SAFETY — capture the MT5 account identity AFTER
+        # mt5.initialize() so the startup alert reflects what the bot is REALLY
+        # connected to (login, server, currency, true balance). The env
+        # INITIAL_BALANCE is a stale config value; the broker's account_info()
+        # is the truth. If the terminal silently switched accounts, the user
+        # sees it on every Bot STARTED message.
+        try:
+            import MetaTrader5 as _mt5
+            _info = _mt5.account_info() if self.cfg.live_mode else None
+        except Exception:
+            _info = None
+
+        if _info is not None:
+            self._mt5_account_id = str(_info.login)
+            self._mt5_server = str(_info.server)
+            self._mt5_currency = str(_info.currency)
+            real_balance = float(_info.balance)
+            # Override env-set INITIAL_BALANCE with the broker's real balance so
+            # status % PnL is relative to today's actual starting capital, not a
+            # stale hardcoded number.
+            self.cfg.initial_balance = real_balance
+            self.executor.balance = real_balance
+            logger.info(
+                "MT5 account_info: login=%s server=%s currency=%s balance=$%.2f",
+                self._mt5_account_id, self._mt5_server, self._mt5_currency, real_balance,
+            )
+        else:
+            self._mt5_account_id = None
+            self._mt5_server = None
+            self._mt5_currency = "USD"
+
         # Startup notification
         learning = self.db.get_learning_summary()
         self.telegram.notify_startup({
             "symbol": self.cfg.mt5.symbol,
             "dry_run": not self.cfg.live_mode,
             "balance": self.executor.balance,
+            "currency": self._mt5_currency,
+            "account_login": self._mt5_account_id,
+            "account_server": self._mt5_server,
             "risk_pct": self.cfg.risk.risk_percent,
             "max_trades": self.cfg.risk.max_trades_per_day,
             "dd_limit": self.cfg.risk.daily_loss_limit,
@@ -350,7 +384,10 @@ class TradingBot:
 
         # Record today's starting balance for daily loss limit calculation.
         # Must run before can_trade() is called so the denominator is stable.
-        self.risk_mgr.record_daily_start(self.executor.balance)
+        self.risk_mgr.record_daily_start(
+            self.executor.balance,
+            account_id=getattr(self, "_mt5_account_id", None),
+        )
 
         # 1. Fetch data (10 days for 400+ bars)
         df = self.data.fetch_bars(lookback_days=10)

@@ -38,21 +38,43 @@ class RiskManager:
         # causing the circuit breaker to trip earlier than the configured limit.
         self._daily_start_balance: Optional[float] = None
         self._daily_start_date: Optional[str] = None
+        # 🔴 REAL-MONEY SAFETY — also key on the MT5 account login. If the terminal
+        # switches accounts mid-session (demo → real, or wrong real account), the
+        # daily-loss denominator must reset. Otherwise an account with $1,000 keeps
+        # using yesterday's $11,000 demo balance as the 4% denominator, so the
+        # circuit breaker won't fire until 46% of the real account is gone.
+        self._daily_start_account: Optional[str] = None
 
     @property
     def current_risk_percent(self) -> float:
         return self._current_risk_pct
 
-    def record_daily_start(self, balance: float) -> None:
+    def record_daily_start(self, balance: float,
+                           account_id: Optional[str] = None) -> None:
         """
         Record today's starting balance (call once per tick before can_trade).
         Used as the denominator for daily loss % so the limit is stable all day.
+
+        Resets when the DATE changes OR the MT5 ACCOUNT changes (terminal swap
+        from demo to real, or wrong real account). Without the account check the
+        loss-limit denominator silently keeps yesterday's other-account balance —
+        catastrophic for a smaller real account (4% of $11k demo = 46% of $1k real).
         """
         today = utc_now().strftime("%Y-%m-%d")
-        if self._daily_start_date != today:
+        if self._daily_start_date != today or self._daily_start_account != account_id:
+            if (self._daily_start_account is not None
+                    and self._daily_start_account != account_id):
+                logger.warning(
+                    "🔴 MT5 account changed (%s → %s) — daily-start balance reset "
+                    "from $%.2f to $%.2f (loss-limit denominator was stale).",
+                    self._daily_start_account, account_id,
+                    self._daily_start_balance or 0.0, balance,
+                )
             self._daily_start_date = today
+            self._daily_start_account = account_id
             self._daily_start_balance = balance
-            logger.info("Daily start balance recorded: $%.2f", balance)
+            logger.info("Daily start balance recorded: $%.2f (account=%s)",
+                        balance, account_id)
 
     def can_trade(self, balance: float) -> tuple:
         """

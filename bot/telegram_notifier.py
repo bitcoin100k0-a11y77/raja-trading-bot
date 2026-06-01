@@ -116,20 +116,41 @@ class TelegramNotifier:
     # === NOTIFICATION TYPES ===
 
     def notify_startup(self, config_summary: Dict):
-        """Bot startup notification."""
+        """Bot startup notification — shows the REAL connected MT5 account so the
+        user sees on every restart which broker/server/balance the bot is on."""
+        login = config_summary.get("account_login")
+        server = config_summary.get("account_server") or "?"
+        currency = config_summary.get("currency") or "USD"
+        # Mask login: keep first 2 + last 3 digits (e.g. 12...574).
+        if login:
+            s = str(login)
+            masked = f"{s[:2]}...{s[-3:]}" if len(s) > 5 else s
+        else:
+            masked = "?"
+        # Demo vs Real flag — derived from server name (most brokers use "Real"
+        # or "Demo" in the server name; covers Exness-MT5Real7, ICMarkets-Demo,
+        # MetaQuotes-Demo, etc.).
+        server_lc = server.lower()
+        is_demo = "demo" in server_lc
+        is_real = "real" in server_lc
+        account_flag = "🟡 DEMO" if is_demo else ("🔴 REAL" if is_real else "⚪ UNKNOWN")
+        mode = "PAPER" if config_summary.get("dry_run", True) else "LIVE"
+        bal = config_summary.get("balance", 0)
         text = (
-            "🚀 <b>RAJA BOT STARTED</b>\n"
+            "🚀 <b>BOT STARTED</b>\n"
             "━━━━━━━━━━━━━━━━━\n"
+            f"Account: <code>{masked}</code> {account_flag}\n"
+            f"Server: {server}\n"
+            f"Balance: {currency} ${bal:,.2f}\n"
             f"Symbol: {config_summary.get('symbol', 'XAUUSD')}\n"
-            f"Mode: {'PAPER' if config_summary.get('dry_run', True) else 'LIVE'}\n"
-            f"Balance: ${config_summary.get('balance', 0):,.2f}\n"
-            f"Risk: {config_summary.get('risk_pct', 1.0)}%\n"
-            f"Max Trades/Day: {config_summary.get('max_trades', 3)}\n"
-            f"Daily DD Limit: {config_summary.get('dd_limit', 3.0)}%\n"
+            f"Mode: {mode}\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"Learning Agent: Active\n"
-            f"Patterns Tracked: {config_summary.get('patterns', 0)}\n"
-            f"Patterns Blocked: {config_summary.get('blocked', 0)}"
+            f"Risk: {config_summary.get('risk_pct', 1.0)}% / trade\n"
+            f"Max trades/day: {config_summary.get('max_trades', 3)}\n"
+            f"Daily loss limit: {config_summary.get('dd_limit', 4.0)}%\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"Patterns tracked: {config_summary.get('patterns', 0)} · "
+            f"blocked: {config_summary.get('blocked', 0)}"
         )
         self.send_sync(text)
 
