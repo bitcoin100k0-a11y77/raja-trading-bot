@@ -124,7 +124,10 @@ class StrategyConfig:
 
     # === TAKE PROFIT ===
     tp1_rr: float = 1.0
-    tp1_close_pct: float = 0.50
+    tp1_close_pct: float = 0.70   # ⚠️ ENV: TP1_CLOSE_PCT — close 70% at TP1, 30% runs to TP2.
+                                  # NOTE: broker min lot 0.01 means a true 70/30 split only
+                                  # realises at lot ≥ 0.03 (0.02→0.01 closed = 50/50;
+                                  # 0.01 can't split → runs full size to TP2).
     tp2_max_rr: float = 2.5
     min_tp1_pips: float = 30.0        # 🔴 LIVE RISK — TP1 floor: if SL < 30p, TP1 = 30p minimum
 
@@ -264,6 +267,7 @@ class BotConfig:
         # SL / TP params
         cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 10.0)
         cfg.strategy.min_tp1_pips = _env_float("MIN_TP1_PIPS", 30.0)
+        cfg.strategy.tp1_close_pct = _env_float("TP1_CLOSE_PCT", 0.70)  # 70% at TP1, 30% to TP2
         cfg.strategy.sl_midpoint_cap_pips = _env_float("SL_MIDPOINT_CAP_PIPS", 50.0)
         cfg.strategy.sl_breakeven_pips    = _env_float("SL_BREAKEVEN_PIPS", 30.0)
 
