@@ -108,7 +108,9 @@ class StrategyConfig:
     # Replaces the legacy 3-stage ladder (+20 → C0, +40 → BE). After BE,
     # trade runs to TP1/TP2/BE-stop with no further SL movement (unless
     # protect_to_tp2=False which re-enables trailing).
-    sl_breakeven_pips: float = 30.0      # ⚠️ ENV: SL_BREAKEVEN_PIPS
+    sl_breakeven_pips: float = 40.0      # ⚠️ ENV: SL_BREAKEVEN_PIPS — move SL to BE at +40p
+                                         # favorable (was 30p; raised so BE doesn't trigger
+                                         # before the trade reaches +40, matching the spec).
 
     # DEPRECATED — kept for backward compat with old code paths and
     # legacy DB rows (sl_stage column accepts 1/2/3). STAGE_2 is now
@@ -128,6 +130,9 @@ class StrategyConfig:
                                   # NOTE: broker min lot 0.01 means a true 70/30 split only
                                   # realises at lot ≥ 0.03 (0.02→0.01 closed = 50/50;
                                   # 0.01 can't split → runs full size to TP2).
+    tp1_full_close_max_lots: float = 0.02  # ⚠️ ENV: TP1_FULL_CLOSE_MAX_LOTS — lots <= this
+                                  # close 100% at TP1 (no TP2 runner). 0.01/0.02 can't be
+                                  # cleanly split at the broker minimum, so take full 1R at TP1.
     tp2_max_rr: float = 2.5
     min_tp1_pips: float = 30.0        # 🔴 LIVE RISK — TP1 floor: if SL < 30p, TP1 = 30p minimum
 
@@ -268,8 +273,9 @@ class BotConfig:
         cfg.strategy.min_sl_pips = _env_float("MIN_SL_PIPS", 10.0)
         cfg.strategy.min_tp1_pips = _env_float("MIN_TP1_PIPS", 30.0)
         cfg.strategy.tp1_close_pct = _env_float("TP1_CLOSE_PCT", 0.70)  # 70% at TP1, 30% to TP2
+        cfg.strategy.tp1_full_close_max_lots = _env_float("TP1_FULL_CLOSE_MAX_LOTS", 0.02)  # <=0.02 → full close at TP1
         cfg.strategy.sl_midpoint_cap_pips = _env_float("SL_MIDPOINT_CAP_PIPS", 50.0)
-        cfg.strategy.sl_breakeven_pips    = _env_float("SL_BREAKEVEN_PIPS", 30.0)
+        cfg.strategy.sl_breakeven_pips    = _env_float("SL_BREAKEVEN_PIPS", 40.0)
 
         # Entry params
         cfg.strategy.rejection_tolerance = _env_float("REJECTION_TOLERANCE", 8.0)

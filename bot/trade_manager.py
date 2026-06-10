@@ -160,7 +160,11 @@ class TradeManager:
             tp1_event = self._check_tp1(trade, tp_check_price)
             if tp1_event:
                 exits.append(tp1_event)
-                # Don't delete — trade continues with remaining lots
+                # Small-lot full close at TP1 — position fully closed, no runner.
+                if tp1_event["full_close"]:
+                    del self.active_trades[trade_id]
+                    continue
+                # Partial — trade continues with remaining lots.
                 # Advance SL stages based on favorable movement
                 self._update_sl_stage(trade, favorable_pips)
                 # Check TP2
@@ -220,7 +224,12 @@ class TradeManager:
         # === CHECK TP1 ===
         tp1_event = self._check_tp1(trade, price)
         if tp1_event:
-            # TP1 hit — partial close. Trade continues with remaining 50%.
+            # Small-lot full close at TP1 — whole position taken, no runner,
+            # no SL-stage advance, no TP2 check. Caller deletes on full_close.
+            if tp1_event["full_close"]:
+                return tp1_event
+
+            # TP1 partial — trade continues with the remaining lots.
             # Advance SL stages to protect remaining position
             self._update_sl_stage(trade, favorable_pips)
 
@@ -294,10 +303,27 @@ class TradeManager:
 
         if hit:
             trade.tp1_hit = True
+            pnl_pips = price_to_pips(abs(trade.tp1_price - trade.entry_price))
+
+            # Small lots can't be cleanly split at the broker 0.01 minimum
+            # (0.01 won't split; 0.02 rounds 70/30 → 50/50). Take the FULL 1:1
+            # at TP1 instead of a degenerate partial — no TP2 runner.
+            full_close_max = getattr(self.cfg, "tp1_full_close_max_lots", 0.02)
+            if trade.lot_size <= full_close_max:
+                trade.partial_close_pct = 1.0   # whole position taken at TP1
+                logger.info("TP1 hit (FULL close, small lot %.2f <= %.2f): %s at %.2f",
+                             trade.lot_size, full_close_max, trade.trade_id, price)
+                return {
+                    "trade_id": trade.trade_id,
+                    "reason": ExitReason.TP1_HIT,
+                    "exit_price": trade.tp1_price,
+                    "pnl_pips": pnl_pips,
+                    "lots_closed": trade.lot_size,
+                    "full_close": True,
+                }
+
             close_lots = round(trade.lot_size * self.cfg.tp1_close_pct, 2)
             trade.partial_close_pct = self.cfg.tp1_close_pct
-
-            pnl_pips = price_to_pips(abs(trade.tp1_price - trade.entry_price))
 
             logger.info("TP1 hit: %s at %.2f, closing %.2f lots (%.0f%%)",
                          trade.trade_id, price, close_lots,
